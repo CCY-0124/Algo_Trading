@@ -1,12 +1,10 @@
-# 根目录下的 .gitignore
-
-# 敏感文件
+# Sensitive files
 config/.secret_key
 config/api_keys.enc
 config/secrets.py
 .env
 
-# 数据文件
+# Data files
 data/
 Trading_Data/
 *.csv
@@ -14,38 +12,38 @@ Trading_Data/
 *.db
 *.feather
 
-# 日志文件
+# Log files
 *.log
 logs/
 
-# Python生成文件
+# Python-generated files
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
 
-# 环境相关
+# Environment-related
 venv/
 .env/
 .venv/
 
-# 编辑器文件
+# Editor files
 .vscode/
 .idea/
 *.ipynb_checkpoints
 *.swp
 *.swo
 
-# 系统文件
+# System files
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# 回测结果
+# Backtest results
 backtesting/results/
 backtesting/reports/
 
-# 临时文件
+# Temporary files
 temp/
 tmp/

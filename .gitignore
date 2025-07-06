@@ -1,0 +1,51 @@
+# 根目录下的 .gitignore
+
+# 敏感文件
+config/.secret_key
+config/api_keys.enc
+config/secrets.py
+.env
+
+# 数据文件
+data/
+Trading_Data/
+*.csv
+*.parquet
+*.db
+*.feather
+
+# 日志文件
+*.log
+logs/
+
+# Python生成文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# 环境相关
+venv/
+.env/
+.venv/
+
+# 编辑器文件
+.vscode/
+.idea/
+*.ipynb_checkpoints
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 回测结果
+backtesting/results/
+backtesting/reports/
+
+# 临时文件
+temp/
+tmp/

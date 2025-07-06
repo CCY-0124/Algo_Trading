@@ -35,8 +35,8 @@ def run_backtest(asset: str = 'BTC', param_method: str = 'pct_change'):
     loader = DataLoader(api_key="YOUR_GLASSNODE_API_KEY", use_database=True)
 
     # Set date range: last 90 days ending 2 days ago
-    end_date = datetime.now() - timedelta(days=2)  # 2天前
-    start_date = end_date - timedelta(days=90)  # 90天前
+    end_date = datetime.now() - timedelta(days=2)
+    start_date = end_date - timedelta(days=90)
 
     logging.info(f"Fetching data for {asset} from {start_date.date()} to {end_date.date()}")
 

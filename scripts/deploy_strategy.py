@@ -1,0 +1,1 @@
+#deploy the strategy to aws

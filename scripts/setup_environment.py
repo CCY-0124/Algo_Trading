@@ -60,14 +60,9 @@ def setup_environment():
         print(f"Creating data directory: {data_path}")
         os.makedirs(data_path)
 
-    # 4. Create symlink if not present
-    project_data_link = os.path.join(os.getcwd(), "data")
-    if not os.path.exists(project_data_link):
-        print(f"Creating symbolic link: {project_data_link} -> {data_path}")
-        if os.name == 'nt':  # Windows
-            subprocess.run(f'mklink /J "{project_data_link}" "{data_path}"', shell=True)
-        else:  # Mac/Linux
-            os.symlink(data_path, project_data_link)
+    # 4. Data path verification
+    print(f"Data path configured: {data_path}")
+    print("Note: Data is stored in D:\\Trading_Data, not in project directory")
 
     print("=" * 50)
     print("Environment setup complete!")

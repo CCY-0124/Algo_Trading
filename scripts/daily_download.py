@@ -16,10 +16,16 @@ import logging
 import sys
 from time import sleep
 import glob
-from config.secrets import get_api_key  # Use your secrets manager
+import sys
+import os
+
+# Add the project root to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# from config.secrets import get_api_key  # Use your secrets manager
 
 # Basic settings
-BASE_PATH = r"C:\Users\Tracy\Trading\glassnode_data"
+BASE_PATH = r"D:\Trading_Data\glassnode_data2"
 CURRENT_API_KEY_TYPE = "main"  # Track which key type we're using
 BASE_URL = "https://api.glassnode.com/v1"
 
@@ -45,7 +51,11 @@ def get_current_api_key():
     """
     global CURRENT_API_KEY_TYPE
     try:
-        return get_api_key("glassnode", CURRENT_API_KEY_TYPE)
+        # Placeholder implementation - replace with actual API key management
+        api_key = os.getenv("GLASSNODE_API_KEY", "YOUR_GLASSNODE_API_KEY")
+        if api_key == "YOUR_GLASSNODE_API_KEY":
+            logging.warning("Using placeholder API key. Set GLASSNODE_API_KEY in .env file")
+        return api_key
     except Exception as e:
         logging.error(f"Failed to get API key: {str(e)}")
         return None
@@ -321,7 +331,9 @@ def update_metric_data(asset, metric_path, last_timestamp, resolution):
             switch_api_key()
             return None
         else:
-            logging.error(f"API request failed - Status code: {response.status_code}, response: {response.text[:200]}")
+            # Mask API key in error message for security
+            masked_params = str(params).replace(api_key, api_key[:8] + "***")
+            logging.error(f"API request failed - Status code: {response.status_code}, response: {response.text[:200]}, params: {masked_params}")
             return None
 
     except Exception as e:
@@ -374,7 +386,7 @@ def update_single_file(file_path, asset, metric_path, min_resolution, tier):
                     last_timestamp = df[timestamp_col].max()
 
             except Exception as e:
-                logging.error(f"Failed to read file: {file_path}, 錯誤: {str(e)}")
+                logging.error(f"Failed to read file: {file_path}, Error: {str(e)}")
                 return 0
         else:
             logging.info(f"File not found, creating new one: {file_path}")

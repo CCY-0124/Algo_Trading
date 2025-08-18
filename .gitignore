@@ -5,12 +5,17 @@ config/secrets.py
 .env
 
 # Data files
+# Local raw data and downloaded data (do not upload)
 data/
 Trading_Data/
+D:/Trading_Data/
 *.csv
 *.parquet
 *.db
 *.feather
+
+# Jupyter notebooks (ignore if you do not want to share analysis process)
+*.ipynb_checkpoints
 
 # Log files
 *.log
@@ -31,9 +36,11 @@ venv/
 # Editor files
 .vscode/
 .idea/
-*.ipynb_checkpoints
 *.swp
 *.swo
+*.iml
+*.xml
+.name
 
 # System files
 .DS_Store
@@ -44,6 +51,24 @@ desktop.ini
 backtesting/results/
 backtesting/reports/
 
+# Optimization and strategy results
+optimization_reports/
+reports/
+config/optimized_params/
+*.strategy
+strategy_*.json
+
 # Temporary files
 temp/
 tmp/
+
+# User-specific or private config
+*.bak
+*.tmp
+*.old
+
+# Generated documentation
+scripts_purpose_documentation.md
+
+# Any personal/sensitive/temp files you do not want to sync
+tools/

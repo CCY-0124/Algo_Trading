@@ -45,12 +45,16 @@ class DataLoader:
             logging.error("API key is required for API access")
             return None
 
+        # Convert dates to Unix timestamps
+        start_timestamp = int(datetime.strptime(start, '%Y-%m-%d').timestamp())
+        end_timestamp = int(datetime.strptime(end, '%Y-%m-%d').timestamp())
+        
         params = {
             'api_key': self.api_key,
             'a': asset,
             'i': '24h',
-            's': start,
-            'u': end,
+            's': start_timestamp,
+            'u': end_timestamp,
             'f': 'json'
         }
 

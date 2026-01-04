@@ -26,7 +26,6 @@ from config.secrets import get_api_key  # Use your secrets manager
 
 # Basic settings
 BASE_PATH = r"D:\Trading_Data\glassnode_data2"
-CURRENT_API_KEY_TYPE = "main"  # Track which key type we're using
 BASE_URL = "https://api.glassnode.com/v1"
 
 # Logs settings
@@ -113,18 +112,17 @@ def validate_csv_data(df, file_path):
 
 def get_current_api_key():
     """
-    Retrieve the currently active Glassnode API key.
+    Retrieve the main Glassnode API key.
 
     :precondition: The API key must be managed using the secrets module
     :postcondition: Returns the key as a string, or logs an error if retrieval fails
     :return: API key string or None
     """
-    global CURRENT_API_KEY_TYPE
     try:
-        # Use the secrets module to get API key
-        api_key = get_api_key("glassnode", CURRENT_API_KEY_TYPE)
+        # Use the secrets module to get main API key only
+        api_key = get_api_key("glassnode", "main")
         if not api_key:
-            logging.error(f"Failed to retrieve {CURRENT_API_KEY_TYPE} API key from secrets")
+            logging.error("Failed to retrieve main API key from secrets")
             return None
         return api_key
     except Exception as e:
@@ -132,23 +130,16 @@ def get_current_api_key():
         return None
 
 
-def switch_api_key():
+def handle_rate_limit():
     """
-    Switch between the main and backup Glassnode API keys.
+    Handle rate limit by waiting before retrying.
 
-    :precondition: `CURRENT_API_KEY_TYPE` must be either 'main' or 'backup'
-    :postcondition: The global API key type is switched and a delay is introduced to avoid rate limit
-    :return: True after switching
+    :precondition: Rate limit error has occurred
+    :postcondition: Waits for a delay to avoid rate limit
+    :return: None
     """
-    global CURRENT_API_KEY_TYPE
-    if CURRENT_API_KEY_TYPE == "main":
-        CURRENT_API_KEY_TYPE = "backup"
-        logging.info("Switched to backup API key")
-    else:
-        CURRENT_API_KEY_TYPE = "main"
-        logging.info("Switched back to main API key")
-    sleep(10)
-    return True
+    logging.warning("Rate limit reached, waiting 60 seconds before retry...")
+    sleep(60)
 
 
 def load_metrics_info():
@@ -410,8 +401,8 @@ def update_metric_data(asset, metric_path, last_timestamp, resolution):
             return pd.DataFrame()
 
         elif response.status_code in [429, 403]:
-            logging.warning(f"API key limit reached - Status code: {response.status_code}")
-            switch_api_key()
+            logging.warning(f"API rate limit reached - Status code: {response.status_code}")
+            handle_rate_limit()
             return None
         else:
             # Mask API key in error message for security

@@ -443,12 +443,18 @@ class EnhancedNonPriceStrategy(EnhancedBacktestEngine):
             if daily_counts.max() > 1:
                 logging.warning(f"Still have multiple rows per day: {daily_counts.head()}")
             else:
-                logging.info(f"Successfully ensured one row per day. Total days: {len(daily_counts)}")
+                # Only log in verbose mode
+                from utils.log_config import should_log
+                if should_log('debug'):
+                    logging.debug(f"Successfully ensured one row per day. Total days: {len(daily_counts)}")
             
-            logging.info(f"Prepared data with rolling={rolling}: {len(merged_data)} records for {asset}/{factor_name}")
-            logging.info(f"Price range: ${merged_data['price'].min():.2f} to ${merged_data['price'].max():.2f}")
-            logging.info(f"Factor range: {merged_data['factor_value'].min():.6f} to {merged_data['factor_value'].max():.6f}")
-            logging.info(f"Rolling return range: {merged_data['rolling_return'].min():.6f} to {merged_data['rolling_return'].max():.6f}")
+            # Only log data preparation details in verbose mode
+            from utils.log_config import should_log
+            if should_log('debug'):
+                logging.debug(f"Prepared data with rolling={rolling}: {len(merged_data)} records for {asset}/{factor_name}")
+                logging.debug(f"Price range: ${merged_data['price'].min():.2f} to ${merged_data['price'].max():.2f}")
+                logging.debug(f"Factor range: {merged_data['factor_value'].min():.6f} to {merged_data['factor_value'].max():.6f}")
+                logging.debug(f"Rolling return range: {merged_data['rolling_return'].min():.6f} to {merged_data['rolling_return'].max():.6f}")
             
             return merged_data
             
@@ -465,12 +471,8 @@ class EnhancedNonPriceStrategy(EnhancedBacktestEngine):
         :param params: Strategy parameters (should include 'rolling', 'long_param', 'short_param', 'date_range')
         :return: Backtest results or None if failed
         """
-        # Debug: Show parameters received
-        print(f"Strategy received parameters: {params}")
-        
         # Prepare data with rolling parameter
         rolling = params.get('rolling', 1)  # Default rolling=1 like legacy algorithm
-        print(f"Using rolling parameter: {rolling}")
         
         # Get date range for API data
         start_date = None
@@ -486,7 +488,6 @@ class EnhancedNonPriceStrategy(EnhancedBacktestEngine):
         # Apply date range filter if provided
         if 'date_range' in params:
             start_date, end_date = params['date_range']
-            print(f"Filtering data by date range: {start_date} to {end_date}")
             
             # Convert date strings to datetime
             start_dt = pd.to_datetime(start_date)
@@ -496,10 +497,10 @@ class EnhancedNonPriceStrategy(EnhancedBacktestEngine):
             data = data[(data['timestamp'] >= start_dt) & (data['timestamp'] <= end_dt)].copy()
             
             if len(data) == 0:
-                print(f"No data found in date range {start_date} to {end_date}")
+                from utils.log_config import should_log
+                if should_log('warning'):
+                    logging.warning(f"No data found in date range {start_date} to {end_date}")
                 return None
-            
-            print(f"Data filtered to {len(data)} rows in date range")
         
         # Execute backtest
         results = self.execute_backtest(data, params)

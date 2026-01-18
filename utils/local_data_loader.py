@@ -4,7 +4,7 @@ local_data_loader.py
 Local data loader for CSV files from Glassnode data directory.
 Handles loading price data and factor data from local CSV files.
 
-:precondition: CSV files must be in D:\Trading_Data\glassnode_data2\{asset}\ directory
+:precondition: CSV files must be in D:\\Trading_Data\\glassnode_data2\\{asset}\\ directory
 :postcondition: Returns standardized DataFrames with 'timestamp' and 'value' columns
 """
 
@@ -362,7 +362,7 @@ class LocalDataLoader:
         :param base_path: Base path to the Glassnode data directory
         """
         self.base_path = base_path
-        self.price_filename = "_market_price_usd_close_tier1.csv"
+        self.price_filename = "market_price_usd_ohlc_tier2.csv"
         
         # Validate base path exists
         if not os.path.exists(base_path):
@@ -613,6 +613,7 @@ class LocalDataLoader:
                        interactive: bool = False, timestamp_col: str = None, value_col: str = None) -> Optional[pd.DataFrame]:
         """
         Load price data for a specific asset with NaN cleaning.
+        Handles OHLC format where 'o' column contains JSON with 'c' (close) price.
         
         :param asset: Asset symbol (e.g., 'BTC')
         :param clean_method: Method to clean NaN values ('drop', 'forward_fill', 'interpolate', etc.)
@@ -625,15 +626,74 @@ class LocalDataLoader:
         
         logging.info(f"Loading price data for {asset} from: {price_file}")
         
-        df = self._load_csv_file(price_file, clean_method=clean_method, 
-                               interactive=interactive, timestamp_col=timestamp_col, value_col=value_col)
-        
-        if df is not None:
-            logging.info(f"Successfully loaded price data for {asset}: {len(df)} records")
-            logging.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
-            logging.info(f"Price range: ${df['value'].min():.2f} to ${df['value'].max():.2f}")
-        else:
-            logging.error(f"Failed to load price data for {asset}")
+        try:
+            # Load raw CSV
+            df = pd.read_csv(price_file)
+            logging.info(f"Loaded {len(df)} rows from: {price_file}")
+            
+            # Check if this is OHLC format (has 'o' column with dict/JSON)
+            if 'o' in df.columns and 't' in df.columns:
+                logging.info("Detected OHLC format, extracting close price from dict/JSON")
+                import ast
+                import json
+                
+                # Extract close price from dict/JSON string in 'o' column
+                def extract_close_price(ohlc_str):
+                    try:
+                        if pd.isna(ohlc_str):
+                            return None
+                        if isinstance(ohlc_str, str):
+                            # Try ast.literal_eval first (for Python dict format)
+                            try:
+                                ohlc_dict = ast.literal_eval(ohlc_str)
+                                return ohlc_dict.get('c', None)
+                            except (ValueError, SyntaxError):
+                                # Try JSON parsing (for JSON format)
+                                try:
+                                    ohlc_dict = json.loads(ohlc_str)
+                                    return ohlc_dict.get('c', None)
+                                except json.JSONDecodeError:
+                                    return None
+                        elif isinstance(ohlc_str, dict):
+                            return ohlc_str.get('c', None)
+                        return None
+                    except (TypeError, AttributeError):
+                        return None
+                
+                # Extract close prices
+                df['value'] = df['o'].apply(extract_close_price)
+                
+                # Convert timestamp
+                df['timestamp'] = pd.to_datetime(df['t'], unit='s', errors='coerce')
+                
+                # Keep only timestamp and value columns
+                df = df[['timestamp', 'value']].copy()
+                
+                # Remove rows with invalid data
+                df = df.dropna(subset=['timestamp', 'value'])
+                
+                # Sort by timestamp
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                
+                logging.info(f"Successfully processed OHLC price data: {len(df)} records")
+            else:
+                # Use standard loading method
+                df = self._load_csv_file(price_file, clean_method=clean_method, 
+                                       interactive=interactive, timestamp_col=timestamp_col, value_col=value_col)
+            
+            if df is not None and len(df) > 0:
+                logging.info(f"Successfully loaded price data for {asset}: {len(df)} records")
+                logging.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+                logging.info(f"Price range: ${df['value'].min():.2f} to ${df['value'].max():.2f}")
+            else:
+                logging.error(f"Failed to load price data for {asset}")
+                return None
+            
+        except Exception as e:
+            logging.error(f"Error loading price data from {price_file}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
         
         return df
     

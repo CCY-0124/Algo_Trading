@@ -72,3 +72,5 @@ scripts_purpose_documentation.md
 
 # Any personal/sensitive/temp files you do not want to sync
 tools/
+config/llm_agent_config.json
+README_CN.md

@@ -22,11 +22,10 @@ import os
 # Add the project root to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# from config.secrets import get_api_key  # Use your secrets manager
+from config.secrets import get_api_key  # Use your secrets manager
 
 # Basic settings
 BASE_PATH = r"D:\Trading_Data\glassnode_data2"
-CURRENT_API_KEY_TYPE = "main"  # Track which key type we're using
 BASE_URL = "https://api.glassnode.com/v1"
 
 # Logs settings
@@ -41,43 +40,106 @@ logging.basicConfig(
 )
 
 
+def safe_read_csv(file_path):
+    """
+    Safely read CSV file with error handling for encoding and parsing issues.
+    
+    :param file_path: Path to the CSV file
+    :return: DataFrame or None if failed
+    """
+    try:
+        # Try UTF-8 first
+        return pd.read_csv(file_path, encoding='utf-8')
+    except UnicodeDecodeError:
+        try:
+            # Try with different encodings
+            return pd.read_csv(file_path, encoding='latin-1')
+        except Exception as e:
+            logging.error(f"Failed to read {file_path} with latin-1 encoding: {str(e)}")
+            return None
+    except pd.errors.ParserError as e:
+        # Handle parsing errors (inconsistent field counts)
+        logging.warning(f"Parser error in {file_path}, trying with error handling: {str(e)}")
+        try:
+            return pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip')
+        except Exception as e2:
+            logging.error(f"Failed to read {file_path} even with error handling: {str(e2)}")
+            return None
+    except Exception as e:
+        logging.error(f"Unexpected error reading {file_path}: {str(e)}")
+        return None
+
+
+def validate_csv_data(df, file_path):
+    """
+    Validate CSV data structure and content.
+    
+    :param df: DataFrame to validate
+    :param file_path: Path to the file for error reporting
+    :return: True if valid, False otherwise
+    """
+    if df is None or df.empty:
+        logging.error(f"DataFrame is empty or None for {file_path}")
+        return False
+    
+    # Check for required columns
+    if len(df.columns) == 0:
+        logging.error(f"No columns found in {file_path}")
+        return False
+    
+    # Check for duplicate column names
+    if len(df.columns) != len(set(df.columns)):
+        logging.warning(f"Duplicate column names found in {file_path}, cleaning...")
+        # Keep only the first occurrence of each column name
+        seen_columns = set()
+        unique_columns = []
+        for col in df.columns:
+            if col not in seen_columns:
+                seen_columns.add(col)
+                unique_columns.append(col)
+            else:
+                logging.warning(f"Removing duplicate column: {col}")
+        df = df[unique_columns]
+    
+    # Check for completely empty rows
+    if df.isnull().all(axis=1).any():
+        empty_rows = df.isnull().all(axis=1).sum()
+        logging.warning(f"Found {empty_rows} completely empty rows in {file_path}, removing...")
+        df.dropna(how='all', inplace=True)
+    
+    return True
+
+
 def get_current_api_key():
     """
-    Retrieve the currently active Glassnode API key.
+    Retrieve the main Glassnode API key.
 
     :precondition: The API key must be managed using the secrets module
     :postcondition: Returns the key as a string, or logs an error if retrieval fails
     :return: API key string or None
     """
-    global CURRENT_API_KEY_TYPE
     try:
-        # Placeholder implementation - replace with actual API key management
-        api_key = os.getenv("GLASSNODE_API_KEY", "YOUR_GLASSNODE_API_KEY")
-        if api_key == "YOUR_GLASSNODE_API_KEY":
-            logging.warning("Using placeholder API key. Set GLASSNODE_API_KEY in .env file")
+        # Use the secrets module to get main API key only
+        api_key = get_api_key("glassnode", "main")
+        if not api_key:
+            logging.error("Failed to retrieve main API key from secrets")
+            return None
         return api_key
     except Exception as e:
         logging.error(f"Failed to get API key: {str(e)}")
         return None
 
 
-def switch_api_key():
+def handle_rate_limit():
     """
-    Switch between the main and backup Glassnode API keys.
+    Handle rate limit by waiting before retrying.
 
-    :precondition: `CURRENT_API_KEY_TYPE` must be either 'main' or 'backup'
-    :postcondition: The global API key type is switched and a delay is introduced to avoid rate limit
-    :return: True after switching
+    :precondition: Rate limit error has occurred
+    :postcondition: Waits for a delay to avoid rate limit
+    :return: None
     """
-    global CURRENT_API_KEY_TYPE
-    if CURRENT_API_KEY_TYPE == "main":
-        CURRENT_API_KEY_TYPE = "backup"
-        logging.info("Switched to backup API key")
-    else:
-        CURRENT_API_KEY_TYPE = "main"
-        logging.info("Switched back to main API key")
-    sleep(10)
-    return True
+    logging.warning("Rate limit reached, waiting 60 seconds before retry...")
+    sleep(60)
 
 
 def load_metrics_info():
@@ -109,8 +171,14 @@ def load_metrics_info():
 
             logging.info(f"Processing metric info for {asset}...")
 
-            # Read CSV files
-            df = pd.read_csv(file_path)
+            # Read CSV files with error handling
+            df = safe_read_csv(file_path)
+            if df is None:
+                continue
+            
+            # Validate the data
+            if not validate_csv_data(df, file_path):
+                continue
 
             # Check if required columns exist
             required_columns = ['path', 'min_resolution', 'supported_assets']
@@ -195,8 +263,14 @@ def update_metrics_info_last_update(asset, metric_path, current_time):
         if not os.path.exists(metrics_file):
             return
 
-        # Read metrics_info CSV
-        df = pd.read_csv(metrics_file)
+        # Read metrics_info CSV with error handling
+        df = safe_read_csv(metrics_file)
+        if df is None:
+            return
+        
+        # Validate the data
+        if not validate_csv_data(df, metrics_file):
+            return
 
         # Create 'last_update' column if missing
         if 'last_update' not in df.columns:
@@ -327,8 +401,8 @@ def update_metric_data(asset, metric_path, last_timestamp, resolution):
             return pd.DataFrame()
 
         elif response.status_code in [429, 403]:
-            logging.warning(f"API key limit reached - Status code: {response.status_code}")
-            switch_api_key()
+            logging.warning(f"API rate limit reached - Status code: {response.status_code}")
+            handle_rate_limit()
             return None
         else:
             # Mask API key in error message for security
@@ -362,8 +436,14 @@ def update_single_file(file_path, asset, metric_path, min_resolution, tier):
 
         if file_exists:
             try:
-                # Read existing data
-                df = pd.read_csv(file_path)
+                # Read existing data with error handling
+                df = safe_read_csv(file_path)
+                if df is None:
+                    return 0
+                
+                # Validate the data
+                if not validate_csv_data(df, file_path):
+                    return 0
 
                 # Fix duplicate or malformed column names
                 df.columns = [str(col).strip() for col in df.columns]
@@ -444,9 +524,11 @@ def update_from_metrics_info():
 
     for asset, metric_path, min_resolution, tier in valid_combinations:
         try:
-            # Generate file name
+            # Generate file name - remove leading underscore and duplicate parts
             filename_parts = metric_path.strip('/').split('/')
-            base_filename = f"_{'_'.join(filename_parts)}_tier{tier}.csv"
+            # Remove any empty parts and join
+            filename_parts = [part for part in filename_parts if part]
+            base_filename = f"{'_'.join(filename_parts)}_tier{tier}.csv"
 
             # Build file path
             asset_dir = os.path.join(BASE_PATH, asset)

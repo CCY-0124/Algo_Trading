@@ -7,9 +7,9 @@ Modify these values to adjust the download behavior.
 
 # Rate limiting configuration - Enhanced for better API handling
 RATE_LIMIT_CONFIG = {
-    'requests_per_minute': 20,  # More conservative limit to avoid rate limits
-    'min_delay_between_requests': 3.0,  # Increased delay between requests
-    'max_delay_between_requests': 120.0,  # Increased max delay
+    'requests_per_minute': 10,  # Conservative limit to avoid rate limits
+    'min_delay_between_requests': 6.0,  # 6 seconds delay between requests (60/10)
+    'max_delay_between_requests': 300.0,  # 300 seconds (5 minutes) wait on rate limit
     'exponential_backoff_base': 2.0,
     'max_retries': 5,  # Increased retries
     'key_switch_delay': 15,  # Increased delay after key switch

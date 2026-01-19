@@ -11,7 +11,7 @@ import os
 import requests
 import json
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import sys
 from time import sleep
@@ -24,14 +24,29 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.secrets import get_api_key  # Use your secrets manager
 
+# Import rate limit configuration
+try:
+    from scripts.download_config import RATE_LIMIT_CONFIG
+    MIN_DELAY = RATE_LIMIT_CONFIG.get('min_delay_between_requests', 3.0)
+    REQUESTS_PER_MINUTE = RATE_LIMIT_CONFIG.get('requests_per_minute', 20)
+except ImportError:
+    # Fallback if config not available
+    MIN_DELAY = 3.0
+    REQUESTS_PER_MINUTE = 20
+
 # Basic settings
 BASE_PATH = r"D:\Trading_Data\glassnode_data2"
 BASE_URL = "https://api.glassnode.com/v1"
 
+# Track skip counts for each file to implement incremental thresholds
+# Format: {file_path: skip_count}
+file_skip_counts = {}
+
 # Logs settings
 LOG_FILE = os.path.join(BASE_PATH, "daily_download.log")
+ERROR_LOG_FILE = os.path.join(BASE_PATH, "api_errors.csv")
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Change to logging.DEBUG to see skip check details
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE),
@@ -130,6 +145,57 @@ def get_current_api_key():
         return None
 
 
+def save_error_to_file(asset, metric_path, status_code, response_body, response_headers, url, params, error_type=''):
+    """
+    Save error details to CSV file for later review.
+    
+    :param asset: Asset symbol
+    :param metric_path: Metric path
+    :param status_code: HTTP status code
+    :param response_body: Response body text
+    :param response_headers: Response headers dict
+    :param url: Request URL
+    :param params: Request parameters (with masked API key)
+    :param error_type: Type of error (404, 403, etc.)
+    :return: None
+    """
+    try:
+        import csv
+        from datetime import datetime
+        
+        # Check if file exists to determine if we need to write header
+        file_exists = os.path.exists(ERROR_LOG_FILE)
+        
+        # Prepare error record
+        error_record = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'asset': asset,
+            'metric_path': metric_path,
+            'status_code': status_code,
+            'error_type': error_type,
+            'response_body': response_body.replace('\n', ' ').replace('\r', ' ')[:500],  # Limit length and remove newlines
+            'url': url,
+            'params': str(params).replace('\n', ' ')[:200],  # Limit length
+            'rate_limit_remaining': response_headers.get('X-Rate-Limit-Remaining', 'N/A'),
+            'rate_limit_reset': response_headers.get('X-Rate-Limit-Reset', 'N/A'),
+        }
+        
+        # Write to CSV file
+        with open(ERROR_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+            fieldnames = ['timestamp', 'asset', 'metric_path', 'status_code', 'error_type', 
+                         'response_body', 'url', 'params', 'rate_limit_remaining', 'rate_limit_reset']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            
+            # Write header if file is new
+            if not file_exists:
+                writer.writeheader()
+            
+            writer.writerow(error_record)
+            
+    except Exception as e:
+        logging.error(f"Failed to save error to file: {str(e)}")
+
+
 def handle_rate_limit():
     """
     Handle rate limit by waiting before retrying.
@@ -138,8 +204,14 @@ def handle_rate_limit():
     :postcondition: Waits for a delay to avoid rate limit
     :return: None
     """
-    logging.warning("Rate limit reached, waiting 60 seconds before retry...")
-    sleep(60)
+    try:
+        from scripts.download_config import RATE_LIMIT_CONFIG
+        wait_time = RATE_LIMIT_CONFIG.get('max_delay_between_requests', 300.0)
+    except ImportError:
+        wait_time = 300.0
+    
+    logging.warning(f"API rate limit reached, waiting {wait_time} seconds ({wait_time/60:.1f} minutes) before retry...")
+    sleep(wait_time)
 
 
 def load_metrics_info():
@@ -400,14 +472,44 @@ def update_metric_data(asset, metric_path, last_timestamp, resolution):
                 return new_data
             return pd.DataFrame()
 
-        elif response.status_code in [429, 403]:
-            logging.warning(f"API rate limit reached - Status code: {response.status_code}")
-            handle_rate_limit()
-            return None
         else:
-            # Mask API key in error message for security
+            # All errors (404, 403, 429, 500, etc.) - log details and skip (don't retry in this run)
             masked_params = str(params).replace(api_key, api_key[:8] + "***")
-            logging.error(f"API request failed - Status code: {response.status_code}, response: {response.text[:200]}, params: {masked_params}")
+            
+            # Determine error type
+            if response.status_code == 404:
+                error_type = "Endpoint Not Found"
+                error_msg = "This endpoint may have been removed by Glassnode."
+            elif response.status_code == 403:
+                error_type = "Forbidden/Access Denied"
+                error_msg = "Rate limit or access denied. May require Studio subscription."
+            elif response.status_code == 429:
+                error_type = "Rate Limit"
+                error_msg = "Rate limit exceeded."
+            else:
+                error_type = f"Error {response.status_code}"
+                error_msg = "Unexpected error."
+            
+            logging.warning(f"API request failed - Status code: {response.status_code} - Asset: {asset}, Metric: {metric_path}")
+            logging.warning(f"URL: {url}")
+            logging.warning(f"Params: {masked_params}")
+            logging.warning(f"Response Headers: {dict(response.headers)}")
+            logging.warning(f"Response Body: {response.text}")
+            logging.warning(f"{error_msg} Will skip this metric in this run.")
+            logging.warning(f"Skipping this metric to avoid wasting API quota.")
+            
+            # Save error to CSV file for later review
+            save_error_to_file(
+                asset=asset,
+                metric_path=metric_path,
+                status_code=response.status_code,
+                response_body=response.text,
+                response_headers=dict(response.headers),
+                url=url,
+                params=masked_params,
+                error_type=error_type
+            )
+            
             return None
 
     except Exception as e:
@@ -473,6 +575,57 @@ def update_single_file(file_path, asset, metric_path, min_resolution, tier):
             # Ensure directory exists
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
+        # Check if data is already up to date to avoid unnecessary API calls
+        # Uses UTC time for comparison and different thresholds based on resolution
+        if file_exists and last_timestamp > 0:
+            # Use UTC time for comparison (timezone-aware)
+            current_time_utc = int(datetime.now(timezone.utc).timestamp())
+            
+            # Handle timestamp format: if timestamp is in milliseconds, convert to seconds
+            if last_timestamp > 1e10:  # Likely in milliseconds (timestamp > year 2286)
+                last_timestamp = last_timestamp / 1000
+            
+            last_timestamp_int = int(last_timestamp)
+            time_since_last = current_time_utc - last_timestamp_int
+            
+            # Get skip count for this file (default to 0 for first check)
+            skip_count = file_skip_counts.get(file_path, 0)
+            
+            # All resolutions check if within 2 days in UTC time
+            threshold_seconds = 172800  # 2 days (172800 seconds) in UTC
+            threshold_description = "2 days (UTC)"
+            
+            # Log skip check details (using UTC time)
+            minutes_ago = time_since_last // 60
+            hours_ago = minutes_ago // 60
+            days_ago = hours_ago // 24
+            seconds_ago = time_since_last % 60
+            last_update_time_utc = datetime.fromtimestamp(last_timestamp_int, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            current_time_utc_str = datetime.fromtimestamp(current_time_utc, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            
+            if days_ago > 0:
+                time_ago_str = f"{days_ago}d {hours_ago % 24}h {minutes_ago % 60}m"
+            elif hours_ago > 0:
+                time_ago_str = f"{hours_ago}h {minutes_ago % 60}m {seconds_ago}s"
+            else:
+                time_ago_str = f"{minutes_ago}m {seconds_ago}s"
+            
+            logging.info(f"Skip check for {asset}/{metric_path}: last_update={last_update_time_utc}, current={current_time_utc_str}, time_since_last={time_ago_str} ({time_since_last}s), threshold={threshold_description}, resolution={min_resolution}")
+            
+            if time_since_last < threshold_seconds:
+                logging.info(f"Data is up to date (updated {time_ago_str} ago, threshold: {threshold_description}), skipping API call for {asset}/{metric_path}")
+                return 0
+            else:
+                # Reset skip count if data is older than threshold (data needs update)
+                if file_path in file_skip_counts:
+                    file_skip_counts[file_path] = 0
+                logging.info(f"Data needs update: time_since_last={time_ago_str} ({time_since_last}s) >= threshold={threshold_description} ({threshold_seconds}s) for {asset}/{metric_path}")
+        else:
+            if not file_exists:
+                logging.info(f"File does not exist, will create new: {file_path}")
+            elif last_timestamp == 0:
+                logging.info(f"File exists but last_timestamp is 0, will download from beginning: {file_path}")
+
         logging.info(f"Starting update from {file_path}")
 
         # Download new data
@@ -484,14 +637,21 @@ def update_single_file(file_path, asset, metric_path, min_resolution, tier):
             if updated_data is not None:
                 after = len(updated_data)
                 added_rows = after - before
-                logging.info(f"Added new rows to {file_path}")
-                sleep(1)  # API limit
+                # Reset skip count since data was successfully updated
+                if file_path in file_skip_counts:
+                    file_skip_counts[file_path] = 0
+                logging.info(f"Added {added_rows} new rows to {file_path}")
+                sleep(MIN_DELAY)  # Respect API rate limit from config
                 return added_rows
             else:
                 logging.error(f"Failed to write data: {file_path}")
                 return 0
         else:
-            logging.info(f"No new data: {file_path}")
+            # API returned no new data, but we still made the call
+            # Reset skip count to 0 so next time we check again (but with 5min threshold)
+            if file_path in file_skip_counts:
+                file_skip_counts[file_path] = 0
+            logging.info(f"No new data from API: {file_path}")
             return 0
 
     except Exception as e:
@@ -517,13 +677,18 @@ def update_from_metrics_info():
 
     # Get valid combinations
     valid_combinations = get_valid_combinations(metrics_info)
-    logging.info(f"Found {len(valid_combinations)} valid combinations")
+    total_combinations = len(valid_combinations)
+    logging.info(f"Found {total_combinations} valid combinations")
 
     updated_files = 0
     updated_rows = 0
+    processed = 0
 
     for asset, metric_path, min_resolution, tier in valid_combinations:
         try:
+            processed += 1
+            percentage = (processed / total_combinations) * 100
+            
             # Generate file name - remove leading underscore and duplicate parts
             filename_parts = metric_path.strip('/').split('/')
             # Remove any empty parts and join
@@ -534,17 +699,24 @@ def update_from_metrics_info():
             asset_dir = os.path.join(BASE_PATH, asset)
             file_path = os.path.join(asset_dir, base_filename)
 
+            # Log progress with percentage
+            logging.info(f"[{processed}/{total_combinations}] ({percentage:.1f}%) Processing: {asset}/{metric_path}")
+
             # Update data
             new_rows = update_single_file(file_path, asset, metric_path, min_resolution, tier)
             if new_rows > 0:
                 updated_files += 1
                 updated_rows += new_rows
+                logging.info(f"  -> Added {new_rows} rows (Progress: {percentage:.1f}%)")
+            else:
+                logging.info(f"  -> No new data (Progress: {percentage:.1f}%)")
 
         except Exception as e:
-            logging.error(f"Error updating {asset}/{metric_path} : {str(e)}")
+            logging.error(f"Error updating {asset}/{metric_path} : {str(e)} (Progress: {percentage:.1f}%)")
             continue
 
     logging.info(f"\n=== Update complete ===")
+    logging.info(f"Total processed: {processed}/{total_combinations} (100.0%)")
     logging.info(f"Number of files updated: {updated_files}")
     logging.info(f"Number of rows added: {updated_rows}")
 

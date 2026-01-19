@@ -26,7 +26,7 @@ from config.secrets import get_api_key  # Use your secrets manager
 
 # Import rate limit configuration
 try:
-    from scripts.download_config import RATE_LIMIT_CONFIG
+    from config.download_config import RATE_LIMIT_CONFIG
     MIN_DELAY = RATE_LIMIT_CONFIG.get('min_delay_between_requests', 3.0)
     REQUESTS_PER_MINUTE = RATE_LIMIT_CONFIG.get('requests_per_minute', 20)
 except ImportError:
@@ -205,7 +205,7 @@ def handle_rate_limit():
     :return: None
     """
     try:
-        from scripts.download_config import RATE_LIMIT_CONFIG
+        from config.download_config import RATE_LIMIT_CONFIG
         wait_time = RATE_LIMIT_CONFIG.get('max_delay_between_requests', 300.0)
     except ImportError:
         wait_time = 300.0

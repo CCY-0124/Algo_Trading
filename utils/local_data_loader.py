@@ -4,7 +4,7 @@ local_data_loader.py
 Local data loader for CSV files from Glassnode data directory.
 Handles loading price data and factor data from local CSV files.
 
-:precondition: CSV files must be in D:\Trading_Data\glassnode_data2\{asset}\ directory
+:precondition: CSV files must be in D:\\Trading_Data\\glassnode_data2\\{asset}\\ directory
 :postcondition: Returns standardized DataFrames with 'timestamp' and 'value' columns
 """
 
@@ -362,7 +362,7 @@ class LocalDataLoader:
         :param base_path: Base path to the Glassnode data directory
         """
         self.base_path = base_path
-        self.price_filename = "market_price_usd_close_tier1.csv"
+        self.price_filename = "market_price_usd_ohlc_tier2.csv"
         
         # Validate base path exists
         if not os.path.exists(base_path):
@@ -613,6 +613,7 @@ class LocalDataLoader:
                        interactive: bool = False, timestamp_col: str = None, value_col: str = None) -> Optional[pd.DataFrame]:
         """
         Load price data for a specific asset with NaN cleaning.
+        Handles OHLC format where 'o' column contains JSON with 'c' (close) price.
         
         :param asset: Asset symbol (e.g., 'BTC')
         :param clean_method: Method to clean NaN values ('drop', 'forward_fill', 'interpolate', etc.)
@@ -625,15 +626,74 @@ class LocalDataLoader:
         
         logging.info(f"Loading price data for {asset} from: {price_file}")
         
-        df = self._load_csv_file(price_file, clean_method=clean_method, 
-                               interactive=interactive, timestamp_col=timestamp_col, value_col=value_col)
-        
-        if df is not None:
-            logging.info(f"Successfully loaded price data for {asset}: {len(df)} records")
-            logging.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
-            logging.info(f"Price range: ${df['value'].min():.2f} to ${df['value'].max():.2f}")
-        else:
-            logging.error(f"Failed to load price data for {asset}")
+        try:
+            # Load raw CSV
+            df = pd.read_csv(price_file)
+            logging.info(f"Loaded {len(df)} rows from: {price_file}")
+            
+            # Check if this is OHLC format (has 'o' column with dict/JSON)
+            if 'o' in df.columns and 't' in df.columns:
+                logging.info("Detected OHLC format, extracting close price from dict/JSON")
+                import ast
+                import json
+                
+                # Extract close price from dict/JSON string in 'o' column
+                def extract_close_price(ohlc_str):
+                    try:
+                        if pd.isna(ohlc_str):
+                            return None
+                        if isinstance(ohlc_str, str):
+                            # Try ast.literal_eval first (for Python dict format)
+                            try:
+                                ohlc_dict = ast.literal_eval(ohlc_str)
+                                return ohlc_dict.get('c', None)
+                            except (ValueError, SyntaxError):
+                                # Try JSON parsing (for JSON format)
+                                try:
+                                    ohlc_dict = json.loads(ohlc_str)
+                                    return ohlc_dict.get('c', None)
+                                except json.JSONDecodeError:
+                                    return None
+                        elif isinstance(ohlc_str, dict):
+                            return ohlc_str.get('c', None)
+                        return None
+                    except (TypeError, AttributeError):
+                        return None
+                
+                # Extract close prices
+                df['value'] = df['o'].apply(extract_close_price)
+                
+                # Convert timestamp
+                df['timestamp'] = pd.to_datetime(df['t'], unit='s', errors='coerce')
+                
+                # Keep only timestamp and value columns
+                df = df[['timestamp', 'value']].copy()
+                
+                # Remove rows with invalid data
+                df = df.dropna(subset=['timestamp', 'value'])
+                
+                # Sort by timestamp
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                
+                logging.info(f"Successfully processed OHLC price data: {len(df)} records")
+            else:
+                # Use standard loading method
+                df = self._load_csv_file(price_file, clean_method=clean_method, 
+                                       interactive=interactive, timestamp_col=timestamp_col, value_col=value_col)
+            
+            if df is not None and len(df) > 0:
+                logging.info(f"Successfully loaded price data for {asset}: {len(df)} records")
+                logging.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+                logging.info(f"Price range: ${df['value'].min():.2f} to ${df['value'].max():.2f}")
+            else:
+                logging.error(f"Failed to load price data for {asset}")
+                return None
+            
+        except Exception as e:
+            logging.error(f"Error loading price data from {price_file}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
         
         return df
     
@@ -670,10 +730,10 @@ class LocalDataLoader:
                                  clean_method: str = 'drop', interactive: bool = False, 
                                  timestamp_col: str = None, value_col: str = None) -> Optional[pd.DataFrame]:
         """
-        Load factor data by parameter name (now directly from asset folder).
+        Load factor data organized by parameter folders.
         
         :param asset: Asset symbol (e.g., 'BTC')
-        :param param_name: Parameter name (e.g., 'sopr_account_based', 'nvt_ratio')
+        :param param_name: Parameter name (folder name, e.g., 'sopr_account_based', 'nvt_ratio')
         :param factor_name: Specific factor file name (if None, will auto-detect)
         :param clean_method: Method to clean NaN values
         :param interactive: Whether to use interactive column selection
@@ -681,105 +741,105 @@ class LocalDataLoader:
         :param value_col: Name of value column (if None, will auto-detect)
         :return: DataFrame with 'timestamp' and 'value' columns, or None if failed
         """
-        # Build path: base_path/asset/factor_name.csv (direct path, no subfolder)
-        asset_path = os.path.join(self.base_path, asset)
+        # Build path: base_path/asset/param_name/factor_name.csv
+        param_folder = os.path.join(self.base_path, asset, param_name)
         
         if factor_name is None:
-            # Auto-detect factor file in asset folder
-            if os.path.exists(asset_path):
-                # Look for files that contain the param_name
-                csv_files = glob.glob(os.path.join(asset_path, f"*{param_name}*.csv"))
+            # Auto-detect factor file in param folder
+            if os.path.exists(param_folder):
+                csv_files = glob.glob(os.path.join(param_folder, "*.csv"))
                 if csv_files:
                     # Use the first CSV file found
                     factor_file = csv_files[0]
                     factor_name = os.path.basename(factor_file).replace('.csv', '')
                     logging.info(f"Auto-detected factor file: {factor_name}")
                 else:
-                    logging.error(f"No CSV files found containing '{param_name}' in asset folder: {asset_path}")
+                    logging.error(f"No CSV files found in parameter folder: {param_folder}")
                     return None
             else:
-                logging.error(f"Asset folder does not exist: {asset_path}")
+                logging.error(f"Parameter folder does not exist: {param_folder}")
                 return None
         else:
-            factor_file = os.path.join(asset_path, f"{factor_name}.csv")
+            factor_file = os.path.join(param_folder, f"{factor_name}.csv")
         
-        logging.info(f"Loading factor data for {asset}/{factor_name} from: {factor_file}")
+        logging.info(f"Loading factor data for {asset}/{param_name}/{factor_name} from: {factor_file}")
         
         df = self._load_csv_file(factor_file, clean_method=clean_method,
                                interactive=interactive, timestamp_col=timestamp_col, value_col=value_col)
         
         if df is not None:
-            logging.info(f"Successfully loaded factor data for {asset}/{factor_name}: {len(df)} records")
+            logging.info(f"Successfully loaded factor data for {asset}/{param_name}/{factor_name}: {len(df)} records")
             logging.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
             logging.info(f"Value range: {df['value'].min():.2f} to {df['value'].max():.2f}")
         else:
-            logging.error(f"Failed to load factor data for {asset}/{factor_name}")
+            logging.error(f"Failed to load factor data for {asset}/{param_name}/{factor_name}")
         
         return df
     
     def get_available_params(self, asset: str) -> List[str]:
         """
-        Get list of available parameter names from CSV filenames.
+        Get list of available parameter folders for an asset.
         
         :param asset: Asset symbol (e.g., 'BTC')
-        :return: List of parameter names extracted from filenames
+        :return: List of parameter folder names
         """
         asset_path = os.path.join(self.base_path, asset)
         if not os.path.exists(asset_path):
             logging.warning(f"Asset path does not exist: {asset_path}")
             return []
         
-        # Get all CSV files and extract parameter names
-        csv_files = glob.glob(os.path.join(asset_path, "*.csv"))
-        param_names = set()
+        # Get all subdirectories (parameter folders)
+        param_folders = []
+        for item in os.listdir(asset_path):
+            item_path = os.path.join(asset_path, item)
+            if os.path.isdir(item_path):
+                param_folders.append(item)
         
-        for file_path in csv_files:
-            filename = os.path.basename(file_path).replace('.csv', '')
-            # Extract parameter name from filename (remove tier suffix)
-            if '_tier' in filename:
-                param_name = filename.split('_tier')[0]
-                param_names.add(param_name)
-        
-        logging.info(f"Available parameters for {asset}: {sorted(param_names)}")
-        return sorted(list(param_names))
+        logging.info(f"Available parameters for {asset}: {param_folders}")
+        return param_folders
     
     def get_available_factors_in_param(self, asset: str, param_name: str) -> List[str]:
         """
-        Get list of available factor files for a parameter name.
+        Get list of available factor files within a parameter folder.
         
         :param asset: Asset symbol (e.g., 'BTC')
-        :param param_name: Parameter name
+        :param param_name: Parameter folder name
         :return: List of factor file names (without .csv extension)
         """
-        asset_path = os.path.join(self.base_path, asset)
-        if not os.path.exists(asset_path):
-            logging.warning(f"Asset folder does not exist: {asset_path}")
+        param_folder = os.path.join(self.base_path, asset, param_name)
+        if not os.path.exists(param_folder):
+            logging.warning(f"Parameter folder does not exist: {param_folder}")
             return []
         
-        # Get all CSV files that contain the parameter name
-        csv_files = glob.glob(os.path.join(asset_path, f"*{param_name}*.csv"))
+        # Get all CSV files in the parameter folder
+        csv_files = glob.glob(os.path.join(param_folder, "*.csv"))
         factor_names = [os.path.basename(f).replace('.csv', '') for f in csv_files]
         
-        logging.info(f"Available factors for {asset}/{param_name}: {factor_names}")
+        logging.info(f"Available factors in {asset}/{param_name}: {factor_names}")
         return factor_names
     
     def create_param_folder_structure(self, asset: str, param_name: str) -> bool:
         """
         Create parameter folder structure for organizing factor data.
-        Note: This function is deprecated as we now use direct file storage.
         
         :param asset: Asset symbol (e.g., 'BTC')
         :param param_name: Parameter folder name to create
         :return: True if successful, False otherwise
         """
-        logging.warning("create_param_folder_structure is deprecated - files are now stored directly in asset folders")
-        return True
+        param_folder = os.path.join(self.base_path, asset, param_name)
+        
+        try:
+            os.makedirs(param_folder, exist_ok=True)
+            logging.info(f"Created parameter folder: {param_folder}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to create parameter folder {param_folder}: {e}")
+            return False
     
     def move_factor_to_param_folder(self, asset: str, old_factor_name: str, param_name: str, 
                                    new_factor_name: str = None) -> bool:
         """
         Move an existing factor file to a parameter folder structure.
-        Note: This function is deprecated as we now use direct file storage.
         
         :param asset: Asset symbol (e.g., 'BTC')
         :param old_factor_name: Current factor file name (without .csv)
@@ -787,8 +847,29 @@ class LocalDataLoader:
         :param new_factor_name: New factor file name (if None, keeps original name)
         :return: True if successful, False otherwise
         """
-        logging.warning("move_factor_to_param_folder is deprecated - files are now stored directly in asset folders")
-        return True
+        old_file = os.path.join(self.base_path, asset, f"{old_factor_name}.csv")
+        if not os.path.exists(old_file):
+            logging.error(f"Source factor file does not exist: {old_file}")
+            return False
+        
+        # Create parameter folder
+        if not self.create_param_folder_structure(asset, param_name):
+            return False
+        
+        # Determine new file name
+        if new_factor_name is None:
+            new_factor_name = old_factor_name
+        
+        new_file = os.path.join(self.base_path, asset, param_name, f"{new_factor_name}.csv")
+        
+        try:
+            import shutil
+            shutil.move(old_file, new_file)
+            logging.info(f"Moved {old_file} to {new_file}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to move factor file: {e}")
+            return False
     
     def load_data_pair(self, asset: str, factor_name: str) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
         """

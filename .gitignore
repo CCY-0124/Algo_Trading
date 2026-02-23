@@ -13,6 +13,7 @@ D:/Trading_Data/
 *.parquet
 *.db
 *.feather
+RAG_input/
 
 # Jupyter notebooks (ignore if you do not want to share analysis process)
 *.ipynb_checkpoints
@@ -74,3 +75,4 @@ scripts_purpose_documentation.md
 tools/
 config/llm_agent_config.json
 README_CN.md
+MEMORY.md

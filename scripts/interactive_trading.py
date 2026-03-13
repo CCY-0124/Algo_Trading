@@ -28,6 +28,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategies.enhanced_non_price_strategy import EnhancedNonPriceStrategy
 from config.trading_config import DEFAULT_INITIAL_CAPITAL
+from core.factor_screening import TwoStageFactorScreening
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -83,13 +84,15 @@ class InteractiveTrading:
         print("1. Run Backtest")
         print("2. Run Optimization")
         print("3. Both (Backtest first, then Optimization)")
+        print("4. Compare (manual backtest vs LLM path, same factor and params)")
+        print("5. Compare grid (manual vs LLM path, same param grid, best Sharpe and params)")
         
         while True:
-            choice = input("\nSelect operation (1-3): ").strip()
-            if choice in ['1', '2', '3']:
+            choice = input("\nSelect operation (1-5): ").strip()
+            if choice in ['1', '2', '3', '4', '5']:
                 return choice
             else:
-                print("Please select 1, 2, or 3.")
+                print("Please select 1, 2, 3, 4, or 5.")
     
     def get_data_source_choice(self) -> bool:
         """Get data source choice (API vs CSV)"""
@@ -301,6 +304,10 @@ class InteractiveTrading:
             print("Enter parameters for BACKTEST:")
         elif self.operation_choice == '2':
             print("Enter parameter ranges for OPTIMIZATION:")
+        elif self.operation_choice == '4':
+            print("Enter parameters for COMPARE (same params used for manual and LLM path):")
+        elif self.operation_choice == '5':
+            print("Enter parameter RANGES for COMPARE GRID (same grid for manual and LLM path):")
         else:  # operation_choice == '3'
             print("Enter parameters for BACKTEST and OPTIMIZATION:")
         
@@ -310,8 +317,8 @@ class InteractiveTrading:
         params['initial_capital'] = self.INITIAL_CAPITAL
         params['lot_size'] = self.LOT_SIZE
         
-        # For backtest or both, ask for individual parameters
-        if self.operation_choice in ['1', '3']:
+        # For backtest, both, compare, or compare grid, ask for individual parameters (or param_method for 5)
+        if self.operation_choice in ['1', '3', '4', '5']:
             # Rolling window
             while True:
                 try:
@@ -357,8 +364,8 @@ class InteractiveTrading:
                 except ValueError:
                     print("Please enter a valid number.")
             
-            # Date range (for API data or optimization)
-            if self.use_api or self.operation_choice in ['2', '3']:
+            # Date range (for API data, optimization, or compare mode)
+            if self.use_api or self.operation_choice in ['2', '3', '4', '5']:
                 print("\n--- DATE RANGE SELECTION ---")
                 while True:
                     try:
@@ -408,8 +415,8 @@ class InteractiveTrading:
             if self.operation_choice in ['2', '3']:
                 params['objective'] = 'sharpe_ratio'
         
-        # Only ask for optimization ranges if optimization is selected
-        if self.operation_choice in ['2', '3']:
+        # Only ask for optimization ranges if optimization or compare grid is selected
+        if self.operation_choice in ['2', '3', '5']:
             print("\n--- OPTIMIZATION PARAMETER RANGES ---")
             print("Enter parameter ranges for optimization (press Enter for default values):")
             
@@ -503,7 +510,14 @@ class InteractiveTrading:
     def confirm_settings(self) -> bool:
         """Display and confirm settings"""
         print("\n--- CONFIRM SETTINGS ---")
-        print(f"Operation: {'Backtest' if self.operation_choice == '1' else 'Optimization' if self.operation_choice == '2' else 'Both (Backtest + Optimization)'}")
+        op_label = {
+            '1': 'Backtest',
+            '2': 'Optimization',
+            '3': 'Both (Backtest + Optimization)',
+            '4': 'Compare (manual vs LLM path, same params)',
+            '5': 'Compare grid (manual vs LLM path, same param grid)'
+        }
+        print(f"Operation: {op_label.get(self.operation_choice, self.operation_choice)}")
         print(f"Data Source: {'API' if self.use_api else 'Local CSV Files'}")
         print(f"Asset: {self.asset}")
         print(f"Factor: {self.factor_name}")
@@ -511,7 +525,7 @@ class InteractiveTrading:
             print(f"Factor file: {self.factor_file}")
         print(f"Parameter Method: {self.parameters.get('param_method', 'pct_change')}")
         print(f"Parameters: {self.parameters}")
-        if self.backtest_ranges and self.operation_choice in ['2', '3']:
+        if self.backtest_ranges and self.operation_choice in ['2', '3', '5']:
             print(f"Backtest ranges: {self.backtest_ranges}")
         
         while True:
@@ -575,6 +589,209 @@ class InteractiveTrading:
             print(f"Backtest failed: {str(e)}")
             logging.exception("Backtest error")
             return {}
+    
+    def run_compare_backtest(self) -> None:
+        """
+        Run same factor with same params through manual backtest and LLM path
+        (single-param grid) and print side-by-side results for consistency check.
+        """
+        print(f"\n--- COMPARE BACKTEST: {self.asset} / {self.factor_name} ---")
+        print("Using same params for manual run and LLM screening path (single combo).")
+        
+        try:
+            initial_capital = self.parameters.get('initial_capital', self.INITIAL_CAPITAL)
+            lot_size = self.parameters.get('lot_size', self.LOT_SIZE)
+            param_method = self.parameters.get('param_method', 'pct_change')
+            date_range = self.parameters.get('date_range')
+            if not date_range:
+                print("ERROR: Compare mode requires date_range. Please run again and set date range.")
+                return
+            
+            strategy = EnhancedNonPriceStrategy(
+                initial_capital=initial_capital,
+                min_lot_size=lot_size,
+                use_api=self.use_api,
+                param_method=param_method
+            )
+            
+            params = {
+                'initial_capital': initial_capital,
+                'lot_size': lot_size,
+                'rolling': self.parameters.get('rolling', 1),
+                'long_param': self.parameters.get('long_param', 0.02),
+                'short_param': self.parameters.get('short_param', -0.02),
+                'param_method': param_method,
+                'date_range': date_range
+            }
+            
+            print("\n1. Manual backtest (strategy.run_backtest)...")
+            result_manual = strategy.run_backtest(
+                asset=self.asset,
+                factor_name=self.factor_name,
+                params=params
+            )
+            
+            print("2. LLM path (screening stage1 with single-param grid)...")
+            screening = TwoStageFactorScreening(
+                strategy=strategy,
+                max_workers=1
+            )
+            param_grid = {
+                'rolling': [params['rolling']],
+                'long_param': [params['long_param']],
+                'short_param': [params['short_param']],
+                'param_method': [param_method]
+            }
+            screening_result = screening.stage1_grid_search(
+                asset=self.asset,
+                factor_name=self.factor_name,
+                param_grid=param_grid,
+                date_range=date_range
+            )
+            result_llm = screening_result.get('best_result') if screening_result else None
+            
+            print("\n" + "=" * 60)
+            print("COMPARE RESULTS (same factor, same params, same date range)")
+            print("=" * 60)
+            
+            def _summary(res: Optional[Dict], label: str) -> None:
+                if not res:
+                    print(f"  {label}: (no result)")
+                    return
+                print(f"  {label}:")
+                print(f"    Sharpe ratio:    {res.get('sharpe_ratio', 0):.4f}")
+                print(f"    Total return:    {res.get('total_return', 0) * 100:.2f}%")
+                print(f"    Annual return:   {res.get('annual_return', 0) * 100:.2f}%")
+                print(f"    Max drawdown:    {res.get('max_drawdown', 0) * 100:.2f}%")
+                print(f"    Num trades:      {res.get('num_of_trade', 0)}")
+                print(f"    Data points:     {res.get('data_points', 0)}")
+            
+            _summary(result_manual, "Manual backtest")
+            print("")
+            _summary(result_llm, "LLM path (stage1 single combo)")
+            
+            if result_manual and result_llm:
+                sr_manual = result_manual.get('sharpe_ratio', 0)
+                sr_llm = result_llm.get('sharpe_ratio', 0)
+                if abs(sr_manual - sr_llm) > 1e-6:
+                    print("\nWARNING: Sharpe ratios differ. Check data source, date_range, and param_method.")
+                else:
+                    print("\nOK: Results match (same engine, same inputs).")
+            print("=" * 60)
+            
+        except Exception as e:
+            print(f"Compare failed: {str(e)}")
+            logging.exception("Compare backtest error")
+    
+    def run_compare_grid(self) -> None:
+        """
+        Run same param grid on manual optimization and LLM stage1 grid search,
+        then print side-by-side best Sharpe and best params.
+        """
+        print(f"\n--- COMPARE GRID: {self.asset} / {self.factor_name} ---")
+        print("Using same param grid for manual run_standardized_optimization and LLM stage1_grid_search.")
+        
+        try:
+            import numpy as np
+            date_range = self.parameters.get('date_range')
+            if not date_range:
+                print("ERROR: Compare grid requires date_range. Please run again and set date range.")
+                return
+            param_method = self.parameters.get('param_method', 'pct_change')
+            initial_capital = self.parameters.get('initial_capital', self.INITIAL_CAPITAL)
+            lot_size = self.parameters.get('lot_size', self.LOT_SIZE)
+            
+            rolling_windows = []
+            if 'rolling_range' in self.backtest_ranges:
+                start, end, step = self.backtest_ranges['rolling_range']
+                rolling_windows = list(range(start, end + 1, step))
+            else:
+                rolling_windows = [self.parameters.get('rolling', 1)]
+            long_params = []
+            if 'long_param_range' in self.backtest_ranges:
+                start, end, step = self.backtest_ranges['long_param_range']
+                long_params = list(np.arange(start, end + step, step))
+            else:
+                long_params = [self.parameters.get('long_param', 0.02)]
+            short_params = []
+            if 'short_param_range' in self.backtest_ranges:
+                start, end, step = self.backtest_ranges['short_param_range']
+                short_params = list(np.arange(start, end + step, step))
+            else:
+                short_params = [self.parameters.get('short_param', -0.02)]
+            
+            n_combo = len(rolling_windows) * len(long_params) * len(short_params)
+            print(f"Param grid size: rolling={len(rolling_windows)}, long={len(long_params)}, short={len(short_params)} -> {n_combo} combinations")
+            print(f"Date range: {date_range[0]} to {date_range[1]}, param_method: {param_method}")
+            
+            strategy = EnhancedNonPriceStrategy(
+                initial_capital=initial_capital,
+                min_lot_size=lot_size,
+                use_api=self.use_api,
+                param_method=param_method
+            )
+            
+            print("\n1. Manual path (strategy.run_standardized_optimization)...")
+            best_manual = strategy.run_standardized_optimization(
+                asset=self.asset,
+                factor_name=self.factor_name,
+                rolling_windows=rolling_windows,
+                long_params=long_params,
+                short_params=short_params,
+                param_method=param_method,
+                objective='sharpe_ratio',
+                date_range=date_range
+            )
+            
+            print("2. LLM path (screening.stage1_grid_search with same grid)...")
+            screening = TwoStageFactorScreening(strategy=strategy, max_workers=1)
+            param_grid = {
+                'rolling': rolling_windows,
+                'long_param': long_params,
+                'short_param': short_params,
+                'param_method': [param_method]
+            }
+            screening_result = screening.stage1_grid_search(
+                asset=self.asset,
+                factor_name=self.factor_name,
+                param_grid=param_grid,
+                date_range=date_range
+            )
+            best_llm = screening_result.get('best_result') if screening_result else None
+            
+            print("\n" + "=" * 60)
+            print("COMPARE GRID RESULTS (same factor, same param grid)")
+            print("=" * 60)
+            
+            def _best_summary(res: Optional[Dict], label: str) -> None:
+                if not res:
+                    print(f"  {label}: (no result)")
+                    return
+                p = res.get('params', {})
+                print(f"  {label}:")
+                print(f"    Best Sharpe:     {res.get('sharpe_ratio', 0):.4f}")
+                print(f"    Best params:     rolling={p.get('rolling')}, long_param={p.get('long_param')}, short_param={p.get('short_param')}")
+                print(f"    Total return:    {res.get('total_return', 0) * 100:.2f}%")
+                print(f"    Annual return:   {res.get('annual_return', 0) * 100:.2f}%")
+                print(f"    Max drawdown:    {res.get('max_drawdown', 0) * 100:.2f}%")
+                print(f"    Num trades:      {res.get('num_of_trade', 0)}")
+            
+            _best_summary(best_manual, "Manual (run_standardized_optimization)")
+            print("")
+            _best_summary(best_llm, "LLM path (stage1_grid_search)")
+            
+            if best_manual and best_llm:
+                sm = best_manual.get('sharpe_ratio', 0)
+                sl = best_llm.get('sharpe_ratio', 0)
+                if abs(sm - sl) > 1e-6:
+                    print("\nWARNING: Best Sharpes differ. Check grid construction or date_range.")
+                else:
+                    print("\nOK: Best Sharpe and best params match (same grid, same engine).")
+            print("=" * 60)
+            
+        except Exception as e:
+            print(f"Compare grid failed: {str(e)}")
+            logging.exception("Compare grid error")
     
     def run_optimization(self) -> Dict:
         """Run optimization with current settings"""
@@ -825,6 +1042,10 @@ class InteractiveTrading:
             elif self.operation_choice == '3':
                 self.run_backtest()
                 self.run_optimization()
+            elif self.operation_choice == '4':
+                self.run_compare_backtest()
+            elif self.operation_choice == '5':
+                self.run_compare_grid()
             
             print("\n--- OPERATION COMPLETE ---")
             

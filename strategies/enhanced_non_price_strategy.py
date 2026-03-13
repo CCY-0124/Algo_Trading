@@ -287,39 +287,43 @@ class EnhancedNonPriceStrategy(EnhancedBacktestEngine):
         else:
             return 0  # Hold (neutral)
     
-    def prepare_data(self, asset: str, factor_name: str, 
+    def prepare_data(self, asset: str, factor_name: str,
                     clean_method: str = 'interpolate', rolling: int = 20,
-                    start_date: str = None, end_date: str = None) -> Optional[pd.DataFrame]:
+                    start_date: str = None, end_date: str = None,
+                    param_method_override: Optional[str] = None) -> Optional[pd.DataFrame]:
         """
-        Prepare data for backtesting with original algo_trading_backtest.py logic
-        
-        :param asset: Asset symbol
-        :param factor_name: Factor name
-        :param clean_method: Method to clean NaN values
-        :param rolling: Rolling window size (default: 20)
-        :param start_date: Start date for API data (YYYY-MM-DD)
-        :param end_date: End date for API data (YYYY-MM-DD)
+        Prepare data for backtesting with original algo_trading_backtest.py logic.
+
+        :param param_method_override: If set, use this method for rolling_return instead of self.param_method (e.g. from grid).
         :return: Prepared DataFrame or None if failed
         """
+        method = param_method_override if param_method_override is not None else self.param_method
         try:
             # Use API data if requested
             if self.use_api and self.api_key and start_date and end_date:
                 logging.info(f"Loading data from Glassnode API for {asset}")
                 data = self.load_api_data(asset, factor_name, start_date, end_date)
                 if data is not None:
-                    # Update rolling return with correct window size
-                    if self.param_method == 'pct_change':
-                        # Percentage Change
+                    if method == 'pct_change':
                         data['rolling_return'] = data['factor_pct_change'].rolling(window=rolling).mean()
-                    elif self.param_method == 'absolute':
-                        # Absolute Change
+                    elif method == 'absolute':
                         data['factor_absolute_change'] = data['factor_value'].diff()
                         data['rolling_return'] = data['factor_absolute_change'].rolling(window=rolling).mean()
-                    elif self.param_method == 'raw':
-                        # Raw Number
+                    elif method == 'raw':
                         data['rolling_return'] = data['factor_value'].rolling(window=rolling).mean()
+                    elif method == 'zscore':
+                        rm = data['factor_value'].rolling(window=rolling).mean()
+                        rs = data['factor_value'].rolling(window=rolling).std()
+                        data['rolling_return'] = (data['factor_value'] - rm) / rs.replace(0, float('nan'))
+                    elif method == 'ratio_ma':
+                        rm = data['factor_value'].rolling(window=rolling).mean()
+                        data['rolling_return'] = data['factor_value'] / rm.replace(0, float('nan'))
+                    elif method == 'minmax':
+                        rmin = data['factor_value'].rolling(window=rolling).min()
+                        rmax = data['factor_value'].rolling(window=rolling).max()
+                        denom = (rmax - rmin).replace(0, float('nan'))
+                        data['rolling_return'] = (data['factor_value'] - rmin) / denom
                     else:
-                        # Default to percentage change
                         data['rolling_return'] = data['factor_pct_change'].rolling(window=rolling).mean()
                     return data
                 else:
@@ -412,27 +416,35 @@ class EnhancedNonPriceStrategy(EnhancedBacktestEngine):
             merged_data['factor_pct_change'] = merged_data['factor_value'].pct_change()
             
             # Calculate rolling return based on param_method
-            if self.param_method == 'pct_change':
-                # Percentage Change
-                # Formula: (x_t - x_{t-1}) / x_{t-1} * 100%
-                # Logic: Standardized volatility for cross-asset comparison
+            if method == 'pct_change':
                 merged_data['rolling_return'] = merged_data['factor_pct_change'].rolling(rolling).mean()
-                
-            elif self.param_method == 'absolute':
-                # Absolute Change
-                # Formula: x_t - x_{t-1}
-                # Logic: Focus on short-term volatility magnitude
+
+            elif method == 'absolute':
                 merged_data['factor_absolute_change'] = merged_data['factor_value'].diff()
                 merged_data['rolling_return'] = merged_data['factor_absolute_change'].rolling(rolling).mean()
-                
-            elif self.param_method == 'raw':
-                # Raw Number
-                # Formula: x_t (raw factor value)
-                # Logic: Direct reflection of absolute indicator level
+
+            elif method == 'raw':
                 merged_data['rolling_return'] = merged_data['factor_value'].rolling(rolling).mean()
-                
+
+            elif method == 'zscore':
+                # Z-Score: (value - rolling_mean) / rolling_std
+                # Best for level/trend data (addresses, volume, on-chain counts).
+                # Output is always in std-deviation units; thresholds ~[-2, 2].
+                rolling_mean = merged_data['factor_value'].rolling(rolling).mean()
+                rolling_std = merged_data['factor_value'].rolling(rolling).std()
+                merged_data['rolling_return'] = (merged_data['factor_value'] - rolling_mean) / rolling_std.replace(0, float('nan'))
+
+            elif method == 'ratio_ma':
+                rolling_mean = merged_data['factor_value'].rolling(rolling).mean()
+                merged_data['rolling_return'] = merged_data['factor_value'] / rolling_mean.replace(0, float('nan'))
+
+            elif method == 'minmax':
+                rolling_min = merged_data['factor_value'].rolling(rolling).min()
+                rolling_max = merged_data['factor_value'].rolling(rolling).max()
+                denom = (rolling_max - rolling_min).replace(0, float('nan'))
+                merged_data['rolling_return'] = (merged_data['factor_value'] - rolling_min) / denom
+
             else:
-                # Default to percentage change
                 merged_data['rolling_return'] = merged_data['factor_pct_change'].rolling(rolling).mean()
             
             # Remove rows with NaN values (first row will have NaN for shifted columns)
@@ -462,26 +474,36 @@ class EnhancedNonPriceStrategy(EnhancedBacktestEngine):
             logging.error(f"Error preparing data: {e}")
             return None
     
-    def run_backtest(self, asset: str, factor_name: str, params: Dict) -> Optional[Dict]:
+    def run_backtest(self, asset: str, factor_name: str, params: Dict,
+                     prepared_data: Optional[pd.DataFrame] = None) -> Optional[Dict]:
         """
         Run backtest with EXACT legacy algorithm logic
-        
+
         :param asset: Asset symbol
         :param factor_name: Factor name
         :param params: Strategy parameters (should include 'rolling', 'long_param', 'short_param', 'date_range')
+        :param prepared_data: Optional pre-loaded DataFrame to skip disk I/O (from cache)
         :return: Backtest results or None if failed
         """
-        # Prepare data with rolling parameter
-        rolling = params.get('rolling', 1)  # Default rolling=1 like legacy algorithm
-        
-        # Get date range for API data
-        start_date = None
-        end_date = None
-        if 'date_range' in params:
-            start_date, end_date = params['date_range']
-        
-        data = self.prepare_data(asset, factor_name, rolling=rolling, 
-                                start_date=start_date, end_date=end_date)
+        rolling = params.get('rolling', 1)
+        param_method = params.get('param_method')
+
+        use_cache = (
+            prepared_data is not None
+            and (param_method is None or param_method == self.param_method)
+        )
+        if use_cache:
+            data = prepared_data.copy()
+        else:
+            start_date = None
+            end_date = None
+            if 'date_range' in params:
+                start_date, end_date = params['date_range']
+            data = self.prepare_data(
+                asset, factor_name, rolling=rolling,
+                start_date=start_date, end_date=end_date,
+                param_method_override=param_method
+            )
         if data is None:
             return None
         

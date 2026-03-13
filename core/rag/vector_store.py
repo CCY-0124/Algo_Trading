@@ -123,7 +123,7 @@ class RAGVectorStore:
         """
         Search by query embedding. Returns documents with metadata and distances.
 
-        :param query_embedding: Query vector from GoogleEmbeddingClient.embed_query
+        :param query_embedding: Query vector from embedding client (e.g. OllamaEmbeddingClient.embed_query)
         :param top_k: Number of results
         :param where: Optional Chroma metadata filter
         :return: List of dicts with document, metadata, distance
@@ -149,3 +149,19 @@ class RAGVectorStore:
         """Return number of documents in the collection."""
         coll = self._ensure_client()
         return coll.count()
+
+    def get_embedding_dimension(self) -> Optional[int]:
+        """
+        Return the embedding dimension expected by this collection.
+        Used to validate query embeddings match the imported model.
+        Returns None if collection is empty.
+        """
+        coll = self._ensure_client()
+        if coll.count() == 0:
+            return None
+        result = coll.get(include=["embeddings"], limit=1)
+        embs = result.get("embeddings")
+        if embs is not None and len(embs) > 0:
+            vec = embs[0]
+            return int(len(vec))
+        return None

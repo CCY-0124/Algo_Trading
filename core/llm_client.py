@@ -21,6 +21,25 @@ import re
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
+import numpy as np
+import pandas as pd
+
+
+def _json_serial(obj: Any) -> Any:
+    """Convert non-JSON-serializable types for json.dumps default=."""
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        return obj.isoformat() if hasattr(obj, 'isoformat') else str(obj)
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -40,29 +59,39 @@ class LLMClient:
     - Response parsing
     """
     
-    def __init__(self, 
+    def __init__(self,
                  api_url: str = "http://localhost:11434/api/chat",
                  model: str = "qwen2.5:3b",
                  timeout: int = 120,
                  max_retries: int = 3,
-                 retry_delay: float = 2.0):
+                 retry_delay: float = 2.0,
+                 fallback_urls: List[str] = None):
         """
         Initialize LLM client.
-        
-        :param api_url: Ollama API endpoint URL
+
+        :param api_url: Primary Ollama API endpoint URL
         :param model: Model name (default: qwen2.5:3b)
         :param timeout: Request timeout in seconds
-        :param max_retries: Maximum number of retry attempts
+        :param max_retries: Maximum number of retry attempts per endpoint
         :param retry_delay: Delay between retries in seconds
+        :param fallback_urls: Ordered list of fallback Ollama endpoints tried
+                              when the primary endpoint is unreachable
+                              (e.g. ["http://<jetson>:11434/api/chat"])
         """
-        self.api_url = api_url
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        
-        logging.info(f"LLM Client initialized")
-        logging.info(f"  API URL: {api_url}")
+
+        # Build ordered endpoint list: primary first, then fallbacks
+        self._endpoints: List[str] = [api_url] + (fallback_urls or [])
+        self._active_endpoint_idx: int = 0
+        self.api_url = self._endpoints[0]
+
+        logging.info("LLM Client initialized")
+        logging.info(f"  Primary URL: {api_url}")
+        if fallback_urls:
+            logging.info(f"  Fallback URLs: {fallback_urls}")
         logging.info(f"  Model: {model}")
         logging.info(f"  Timeout: {timeout}s")
     
@@ -83,74 +112,90 @@ class LLMClient:
                 "temperature": temperature,
                 "num_predict": max_tokens
             },
-            "stream": False
+            "stream": False,
+            "think": False
         }
         
         headers = {"Content-Type": "application/json"}
-        
-        for attempt in range(self.max_retries):
-            try:
-                logging.debug(f"LLM request attempt {attempt + 1}/{self.max_retries}")
-                
-                response = requests.post(
-                    self.api_url,
-                    json=payload,
-                    headers=headers,
-                    timeout=self.timeout
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    
-                    # Extract content from Ollama response
-                    content = result.get('message', {}).get('content', '')
-                    if not content:
-                        # Sometimes Ollama returns content directly
-                        content = result.get('response', '')
-                    
-                    return {
-                        'content': content,
-                        'model': result.get('model', self.model),
-                        'done': result.get('done', True)
-                    }
-                else:
-                    error_msg = f"HTTP {response.status_code}: {response.text}"
-                    logging.error(f"LLM API error: {error_msg}")
-                    
-                    if attempt < self.max_retries - 1:
-                        wait_time = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                        logging.info(f"Retrying in {wait_time:.1f} seconds...")
-                        time.sleep(wait_time)
+
+        # Try each endpoint in order; move to next on connection failure
+        for ep_idx in range(self._active_endpoint_idx, len(self._endpoints)):
+            current_url = self._endpoints[ep_idx]
+
+            for attempt in range(self.max_retries):
+                try:
+                    logging.debug(
+                        f"LLM request attempt {attempt + 1}/{self.max_retries} "
+                        f"-> {current_url}"
+                    )
+
+                    response = requests.post(
+                        current_url,
+                        json=payload,
+                        headers=headers,
+                        timeout=self.timeout
+                    )
+
+                    if response.status_code == 200:
+                        result = response.json()
+
+                        # Extract content from Ollama response
+                        content = result.get('message', {}).get('content', '')
+                        if not content:
+                            content = result.get('response', '')
+
+                        # Promote this endpoint as active for future calls
+                        if ep_idx != self._active_endpoint_idx:
+                            logging.info(
+                                f"Switched active LLM endpoint to: {current_url}"
+                            )
+                            self._active_endpoint_idx = ep_idx
+                            self.api_url = current_url
+
+                        return {
+                            'content': content,
+                            'model': result.get('model', self.model),
+                            'done': result.get('done', True)
+                        }
                     else:
-                        return None
-                        
-            except requests.exceptions.Timeout:
-                logging.error(f"Request timeout after {self.timeout}s")
-                if attempt < self.max_retries - 1:
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    logging.info(f"Retrying in {wait_time:.1f} seconds...")
-                    time.sleep(wait_time)
-                else:
-                    return None
-                    
-            except requests.exceptions.ConnectionError:
-                logging.error(f"Connection error: Cannot reach {self.api_url}")
-                logging.error("Please ensure Ollama is running on Jetson")
-                if attempt < self.max_retries - 1:
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    logging.info(f"Retrying in {wait_time:.1f} seconds...")
-                    time.sleep(wait_time)
-                else:
-                    return None
-                    
-            except Exception as e:
-                logging.error(f"Unexpected error: {e}")
-                if attempt < self.max_retries - 1:
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    time.sleep(wait_time)
-                else:
-                    return None
-        
+                        error_msg = f"HTTP {response.status_code}: {response.text}"
+                        logging.error(f"LLM API error: {error_msg}")
+                        if attempt < self.max_retries - 1:
+                            wait_time = self.retry_delay * (2 ** attempt)
+                            logging.info(f"Retrying in {wait_time:.1f}s...")
+                            time.sleep(wait_time)
+
+                except requests.exceptions.Timeout:
+                    logging.error(f"Request timeout after {self.timeout}s ({current_url})")
+                    if attempt < self.max_retries - 1:
+                        wait_time = self.retry_delay * (2 ** attempt)
+                        time.sleep(wait_time)
+
+                except requests.exceptions.ConnectionError as e:
+                    cause = getattr(e, "__cause__", None)
+                    cause_str = str(cause) if cause else (e.args[0] if e.args else str(e))
+                    logging.warning(
+                        "Cannot reach LLM endpoint: %s (cause: %s)",
+                        current_url,
+                        cause_str,
+                    )
+                    # Connection error: no point retrying same endpoint
+                    break
+
+                except Exception as e:
+                    logging.error(f"Unexpected error: {e}")
+                    if attempt < self.max_retries - 1:
+                        wait_time = self.retry_delay * (2 ** attempt)
+                        time.sleep(wait_time)
+
+            # Current endpoint exhausted; try next
+            if ep_idx + 1 < len(self._endpoints):
+                logging.warning(
+                    f"Falling back to next LLM endpoint: "
+                    f"{self._endpoints[ep_idx + 1]}"
+                )
+
+        logging.error("All LLM endpoints failed")
         return None
     
     def _create_structured_prompt(self, factor_data: Dict) -> str:
@@ -169,7 +214,7 @@ class LLMClient:
 
 Factor Analysis Task:
 Factor Name: {factor_name}
-Parameter Settings: {json.dumps(factor_params, indent=2, ensure_ascii=False)}
+Parameter Settings: {json.dumps(factor_params, indent=2, ensure_ascii=False, default=_json_serial)}
 Backtest Results:
 - Total Return: {backtest_results.get('total_return', 0):.2%}
 - Annual Return: {backtest_results.get('annual_return', 0):.2%}
@@ -384,12 +429,10 @@ Answer only in JSON, no other text."""
     def _create_iterative_prompt(self, factor_data: Dict) -> str:
         """
         Create prompt for iterative optimization with full data.
-        
+
         :param factor_data: Dictionary containing factor information and data
         :return: Formatted prompt string
         """
-        import json
-        
         factor_name = factor_data.get('factor_name', 'Unknown')
         current_params = factor_data.get('current_params', {})
         current_result = factor_data.get('current_result', {})
@@ -397,16 +440,15 @@ Answer only in JSON, no other text."""
         previous_iterations = factor_data.get('previous_iterations', [])
         top_stage1_results = factor_data.get('top_stage1_results', [])
         historical_context = factor_data.get('historical_context', '')
-        raw_factor_data = factor_data.get('factor_data', [])
-        data_summary = factor_data.get('data_summary', {})
-        
-        prompt = f"""You are a quantitative trading analysis expert conducting iterative optimization. Please perform deep analysis based on complete factor data and historical results.
+        factor_data_summary = factor_data.get('factor_data_summary') or factor_data.get('data_summary', {})
+
+        prompt = f"""You are a quantitative trading analysis expert conducting iterative optimization. Use the factor summary and backtest results below to suggest parameter changes.
 
 Factor Name: {factor_name}
 Current Iteration: {iteration}
 
 Current Parameter Settings:
-{json.dumps(current_params, indent=2, ensure_ascii=False)}
+{json.dumps(current_params, indent=2, ensure_ascii=False, default=_json_serial)}
 
 Current Backtest Results:
 - Sharpe Ratio: {current_result.get('sharpe_ratio', 0):.4f}
@@ -438,21 +480,21 @@ Current Backtest Results:
         if historical_context:
             prompt += f"\nHistorical Analysis Records:\n{historical_context}\n"
         
-        # Add complete factor data
-        if raw_factor_data:
-            if data_summary:
-                prompt += f"\nFactor Data Summary:\n"
-                prompt += f"- Total Data Points: {data_summary.get('total_rows', len(raw_factor_data))}\n"
-                if data_summary.get('date_range'):
-                    prompt += f"- Date Range: {data_summary['date_range'].get('start')} to {data_summary['date_range'].get('end')}\n"
-            
-            prompt += f"\nComplete Factor Data (Total {len(raw_factor_data)} rows, all data):\n"
-            # Format data as JSON array for better readability
-            # Send all data rows
-            prompt += json.dumps(raw_factor_data, indent=2, ensure_ascii=False)
+        # Add factor summary only (full series not sent to avoid timeout)
+        if factor_data_summary:
+            prompt += "\nFactor Data Summary:\n"
+            prompt += f"- Total Data Points: {factor_data_summary.get('total_rows', 'N/A')}\n"
+            if factor_data_summary.get('date_range'):
+                dr = factor_data_summary['date_range']
+                prompt += f"- Date Range: {dr.get('start')} to {dr.get('end')}\n"
+            if factor_data_summary.get('value_stats'):
+                vs = factor_data_summary['value_stats']
+                prompt += f"- Value Stats: min={vs.get('min')}, max={vs.get('max')}, mean={vs.get('mean')}, std={vs.get('std')}\n"
+            if factor_data_summary.get('last_n'):
+                prompt += f"- Last N sample: {json.dumps(factor_data_summary['last_n'], default=_json_serial)}\n"
         
         prompt += """
-Please analyze the patterns, trends, and characteristics of the factor data based on the complete information above, then provide optimization suggestions.
+Please analyze based on the factor summary and backtest results above, then provide optimization suggestions.
 
 Please answer in JSON format:
 {
@@ -525,23 +567,59 @@ Answer only in JSON, no other text."""
         :return: True if connection successful, False otherwise
         """
         logging.info("Testing connection to Ollama service...")
-        
+        base_url = self.api_url.rsplit("/", 2)[0]
+        try:
+            r = requests.get(f"{base_url}/api/tags", timeout=10)
+            if r.status_code != 200:
+                logging.warning("Ollama /api/tags returned HTTP %s", r.status_code)
+            else:
+                logging.info("Ollama reachable at %s", base_url)
+        except requests.exceptions.ConnectionError as e:
+            cause = getattr(e, "__cause__", None)
+            cause_str = str(cause) if cause else (e.args[0] if e.args else str(e))
+            logging.error("Cannot reach Ollama at %s: %s", base_url, cause_str)
+            logging.info(
+                "Check: (1) Ollama running on Jetson, (2) correct IP and port 11434, "
+                "(3) Jetson and PC on same network, (4) firewall allows port 11434"
+            )
+            return False
+        except requests.exceptions.Timeout:
+            logging.error("Timeout reaching Ollama at %s", base_url)
+            return False
+        except Exception as e:
+            logging.error("Unexpected error probing Ollama: %s", e)
+            return False
+
         test_messages = [
             {
                 "role": "user",
                 "content": "Hello, this is a connection test. Please respond with 'OK'."
             }
         ]
-        
         response = self._make_request(test_messages, temperature=0.1, max_tokens=10)
-        
-        if response and response.get('content'):
-            logging.info("[OK] Connection test successful")
-            logging.info(f"Response: {response['content'][:100]}")
+
+        if response and isinstance(response, dict) and "model" in response:
+            content = response.get("content") or ""
+            if content:
+                logging.info("[OK] Connection test successful")
+                logging.info("Response: %s", content[:100])
+            else:
+                logging.info(
+                    "[OK] Connection test successful (chat API replied; content empty)"
+                )
             return True
+        if response is not None:
+            logging.error(
+                "Chat API responded but no content (keys: %s)",
+                list(response.keys()) if isinstance(response, dict) else type(response),
+            )
         else:
-            logging.error("[ERROR] Connection test failed")
-            return False
+            logging.error("Chat request failed (see warnings above for cause)")
+        logging.info(
+            "Check: (1) Ollama running on Jetson, (2) correct IP and port 11434, "
+            "(3) Jetson and PC on same network, (4) firewall allows port 11434"
+        )
+        return False
 
 
 if __name__ == "__main__":

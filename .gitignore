@@ -15,6 +15,9 @@ D:/Trading_Data/
 *.feather
 RAG_input/
 
+# RAG vector store (generated at runtime)
+chroma_db/
+
 # Jupyter notebooks (ignore if you do not want to share analysis process)
 *.ipynb_checkpoints
 

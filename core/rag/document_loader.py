@@ -232,6 +232,34 @@ def discover_posts(rag_input_dir: Optional[Path] = None) -> List[Dict[str, Any]]
     return entries
 
 
+def load_full_document_by_source(
+    source_file: str,
+    rag_input_dir: Optional[Path] = None,
+) -> Optional[str]:
+    """
+    Load full document content given source_file from chunk metadata.
+    source_file format: "author|rel_path" where rel_path is relative to RAG_input root.
+
+    :param source_file: From metadata["source_file"], e.g. "Author Name|Author Name/post/file.txt"
+    :param rag_input_dir: Override RAG input root (default from config)
+    :return: Full document text or None if not found
+    """
+    if not source_file or "|" not in source_file:
+        return None
+    _, rel_path_str = source_file.split("|", 1)
+    root = Path(rag_input_dir) if rag_input_dir else get_rag_input_dir()
+    path = root / rel_path_str.strip()
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        suf = path.suffix.lower()
+        if suf in (".ipynb", ".json"):
+            return _read_ipynb(path)
+        return _read_text_file(path)
+    except Exception:
+        return None
+
+
 def load_rag_documents(
     rag_input_dir: Optional[Path] = None,
     chunk_size: int = 800,

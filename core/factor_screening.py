@@ -16,9 +16,10 @@ Features:
 import logging
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from itertools import product
+from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 
 from strategies.enhanced_non_price_strategy import EnhancedNonPriceStrategy
@@ -26,6 +27,48 @@ from core.llm_client import LLMClient
 from core.performance_monitor import PerformanceMonitor
 from core.factor_status_tracker import get_status_tracker, FactorStatus
 from utils.log_config import should_log
+
+
+def _run_combo_batch(args: tuple) -> List[Dict]:
+    """
+    Module-level worker for ProcessPoolExecutor.
+
+    Each worker creates its own strategy instance (and LocalDataLoader).
+    LocalDataLoader caches raw CSVs in-process, so only the first combo
+    in each worker pays the disk read cost.
+
+    :param args: Tuple of (combo_batch, param_names, common_params,
+                           asset, factor_name, initial_capital,
+                           min_lot_size, param_method)
+    :return: List of result dicts for the batch
+    """
+    (combo_batch, param_names, common_params,
+     asset, factor_name, initial_capital, min_lot_size, param_method) = args
+
+    strategy = EnhancedNonPriceStrategy(
+        initial_capital=initial_capital,
+        min_lot_size=min_lot_size,
+        param_method=param_method
+    )
+
+    results = []
+    for i, combination in combo_batch:
+        params = dict(zip(param_names, combination))
+        params.update(common_params)
+        try:
+            result = strategy.run_backtest(asset, factor_name, params)
+            if result:
+                annual_return = result.get('annual_return', 0)
+                max_drawdown = result.get('max_drawdown', 0)
+                calmar = (annual_return / abs(max_drawdown)
+                          if abs(max_drawdown) > 0.001 else 0.0)
+                result['calmar_ratio'] = calmar
+                result['params'] = params
+                result['combination_index'] = i
+                results.append(result)
+        except Exception:
+            continue
+    return results
 
 # Configure logging (minimal - use progress bars instead)
 logging.basicConfig(
@@ -47,7 +90,8 @@ class TwoStageFactorScreening:
                  llm_client: LLMClient = None,
                  min_sharpe_threshold: float = 0.5,
                  min_calmar_threshold: float = 0.3,
-                 performance_monitor: PerformanceMonitor = None):
+                 performance_monitor: PerformanceMonitor = None,
+                 max_workers: int = 4):
         """
         Initialize two-stage screening system.
         
@@ -56,17 +100,21 @@ class TwoStageFactorScreening:
         :param min_sharpe_threshold: Minimum Sharpe ratio to continue
         :param min_calmar_threshold: Minimum Calmar ratio to continue
         :param performance_monitor: Performance monitor instance
+        :param max_workers: Number of parallel workers for Stage 1 grid search
+                            (set to 1 to disable parallelism)
         """
         self.strategy = strategy
         self.llm_client = llm_client
         self.min_sharpe_threshold = min_sharpe_threshold
         self.min_calmar_threshold = min_calmar_threshold
         self.performance_monitor = performance_monitor
+        self.max_workers = max_workers
         self.status_tracker = get_status_tracker()
-        
+
         logging.info("Two-Stage Factor Screening initialized")
         logging.info(f"  Min Sharpe threshold: {min_sharpe_threshold}")
         logging.info(f"  Min Calmar threshold: {min_calmar_threshold}")
+        logging.info(f"  Max workers (Stage 1): {max_workers}")
     
     def _calculate_calmar_ratio(self, annual_return: float, max_drawdown: float) -> float:
         """
@@ -132,67 +180,110 @@ class TwoStageFactorScreening:
         if param_method:
             logging.info(f"  Using param_method: {param_method}")
         
-        results = []
+        # Common parameters shared across all combinations
+        common_params: Dict = {'initial_capital': self.strategy.initial_capital,
+                               'lot_size': self.strategy.min_lot_size}
+        if date_range:
+            common_params['date_range'] = date_range
+        if param_method:
+            common_params['param_method'] = param_method
+
+        indexed_combos = list(enumerate(param_combinations, 1))
+
+        # P2: Pre-load data per unique rolling to avoid repeated disk I/O
+        rolling_idx = param_names.index("rolling") if "rolling" in param_names else None
+        unique_rollings = list(dict.fromkeys(
+            c[param_names.index("rolling")] if rolling_idx is not None else 1
+            for c in param_combinations
+        ))
+        data_cache: Dict[tuple, Any] = {}
+        for rv in unique_rollings:
+            try:
+                data = self.strategy.prepare_data(
+                    asset, factor_name, rolling=rv,
+                    start_date=date_range[0] if date_range else None,
+                    end_date=date_range[1] if date_range else None,
+                )
+                if data is not None:
+                    data_cache[(asset, factor_name, rv)] = data
+            except Exception as e:
+                if should_log("warning"):
+                    logging.warning(f"  Pre-load data for rolling={rv} failed: {e}")
+
+        # Parallel execution when grid is large enough to benefit
+        use_parallel = self.max_workers > 1 and total_combinations >= 50
+        raw_results: List[Dict] = []
+
+        if use_parallel:
+            # Split combos evenly across workers
+            chunk_size = max(1, total_combinations // self.max_workers)
+            batches = [indexed_combos[s:s + chunk_size]
+                       for s in range(0, total_combinations, chunk_size)]
+            args_list = [
+                (batch, param_names, common_params,
+                 asset, factor_name,
+                 self.strategy.initial_capital,
+                 self.strategy.min_lot_size,
+                 getattr(self.strategy, 'param_method', 'pct_change'))
+                for batch in batches
+            ]
+            logging.info(f"  Running parallel grid search: {len(batches)} workers")
+            try:
+                with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                    for batch_result in executor.map(_run_combo_batch, args_list):
+                        raw_results.extend(batch_result)
+            except Exception as e:
+                logging.warning(f"  Parallel execution failed ({e}), falling back to sequential")
+                use_parallel = False
+
+        if not use_parallel:
+            # Sequential fallback (also used for small grids)
+            progress_bar = tqdm(
+                indexed_combos,
+                total=total_combinations,
+                desc=f"Grid search {asset}/{factor_name[:30]}",
+                unit="comb",
+                disable=not should_log('info')
+            )
+            best_sharpe_live = -np.inf
+            for i, combination in progress_bar:
+                params = dict(zip(param_names, combination))
+                params.update(common_params)
+                rolling = params.get("rolling", 1)
+                cached_data = data_cache.get((asset, factor_name, rolling))
+                try:
+                    result = self.strategy.run_backtest(
+                        asset, factor_name, params, prepared_data=cached_data
+                    )
+                    if result:
+                        annual_return = result.get('annual_return', 0)
+                        max_drawdown = result.get('max_drawdown', 0)
+                        result['calmar_ratio'] = self._calculate_calmar_ratio(
+                            annual_return, max_drawdown)
+                        result['params'] = params
+                        result['combination_index'] = i
+                        raw_results.append(result)
+                        sharpe = result.get('sharpe_ratio', 0)
+                        if sharpe > best_sharpe_live:
+                            best_sharpe_live = sharpe
+                        if should_log('info'):
+                            progress_bar.set_postfix(
+                                {'Best Sharpe': f'{best_sharpe_live:.4f}'})
+                except Exception as e:
+                    if should_log('error'):
+                        logging.error(f"  Error testing combination {i}: {e}")
+                    continue
+            progress_bar.close()
+
+        # Aggregate results
+        results = raw_results
         best_result = None
         best_sharpe = -np.inf
-        
-        # Use progress bar instead of frequent logging
-        progress_bar = tqdm(
-            enumerate(param_combinations, 1),
-            total=total_combinations,
-            desc=f"Grid search {asset}/{factor_name[:30]}",
-            unit="comb",
-            disable=not should_log('info')  # Disable if quiet mode
-        )
-        
-        # Test each parameter combination
-        for i, combination in progress_bar:
-            params = dict(zip(param_names, combination))
-            
-            # Add required parameters
-            params['initial_capital'] = self.strategy.initial_capital
-            params['lot_size'] = self.strategy.min_lot_size
-            if date_range:
-                params['date_range'] = date_range
-            
-            # Add param_method if specified
-            if param_method:
-                params['param_method'] = param_method
-            
-            try:
-                # Run backtest
-                result = self.strategy.run_backtest(asset, factor_name, params)
-                
-                if result:
-                    # Calculate Calmar ratio
-                    annual_return = result.get('annual_return', 0)
-                    max_drawdown = result.get('max_drawdown', 0)
-                    calmar_ratio = self._calculate_calmar_ratio(annual_return, max_drawdown)
-                    
-                    # Add metrics
-                    result['calmar_ratio'] = calmar_ratio
-                    result['params'] = params
-                    result['combination_index'] = i
-                    
-                    results.append(result)
-                    
-                    # Track best result
-                    sharpe_ratio = result.get('sharpe_ratio', 0)
-                    if sharpe_ratio > best_sharpe:
-                        best_sharpe = sharpe_ratio
-                        best_result = result
-                    
-                    # Update progress bar with best Sharpe
-                    if should_log('info'):
-                        progress_bar.set_postfix({'Best Sharpe': f'{best_sharpe:.4f}'})
-            
-            except Exception as e:
-                if should_log('error'):
-                    logging.error(f"  Error testing combination {i}: {e}")
-                continue
-        
-        # Close progress bar
-        progress_bar.close()
+        for r in results:
+            sharpe_ratio = r.get('sharpe_ratio', 0)
+            if sharpe_ratio > best_sharpe:
+                best_sharpe = sharpe_ratio
+                best_result = r
         
         if self.performance_monitor:
             self.performance_monitor.end_operation("stage1_grid_search")
@@ -370,19 +461,35 @@ class TwoStageFactorScreening:
                     'factor_data': None  # Will be set if factor_data provided
                 }
                 
-                # Add complete factor data if available
+                # Send factor summary only (no full series) to avoid timeout and keep prompt small
                 if factor_data is not None and len(factor_data) > 0:
-                    # Convert DataFrame to list of dicts for JSON serialization
-                    # Send full data to LLM for complete analysis
-                    llm_input['factor_data'] = factor_data.to_dict('records')
-                    llm_input['data_summary'] = {
+                    value_col = 'value' if 'value' in factor_data.columns else factor_data.columns[1]
+                    values = factor_data[value_col].dropna()
+                    n_sample = 20
+                    last_n = factor_data.tail(n_sample)
+                    last_n_list = []
+                    for _, row in last_n.iterrows():
+                        rec = {'value': float(row[value_col])}
+                        if 'timestamp' in row.index:
+                            ts = row['timestamp']
+                            rec['timestamp'] = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
+                        last_n_list.append(rec)
+                    llm_input['factor_data_summary'] = {
                         'total_rows': len(factor_data),
                         'date_range': {
                             'start': str(factor_data.iloc[0]['timestamp']) if 'timestamp' in factor_data.columns else None,
                             'end': str(factor_data.iloc[-1]['timestamp']) if 'timestamp' in factor_data.columns else None
-                        }
+                        },
+                        'value_stats': {
+                            'min': float(values.min()),
+                            'max': float(values.max()),
+                            'mean': float(values.mean()),
+                            'std': float(values.std())
+                        } if len(values) > 0 else {},
+                        'last_n': last_n_list
                     }
-                    logging.info(f"  Sending full factor data: {len(factor_data)} rows")
+                    llm_input['data_summary'] = llm_input['factor_data_summary']
+                    logging.info(f"  Sending factor summary only (total_rows={len(factor_data)}, last_{n_sample} sample)")
                 
                 # Request LLM analysis with full context
                 llm_analysis = self.llm_client.analyze_factor_iterative(llm_input)

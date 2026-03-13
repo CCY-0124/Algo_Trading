@@ -16,9 +16,26 @@ import sqlite3
 import json
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 from enum import Enum
+
+try:
+    import pandas as pd
+    _HAS_PANDAS = True
+except ImportError:
+    _HAS_PANDAS = False
+
+
+def _sanitize_for_json(obj: Any) -> Any:
+    """Replace non-JSON-serializable values (e.g. DataFrame) with placeholders."""
+    if _HAS_PANDAS and isinstance(obj, pd.DataFrame):
+        return {"_type": "DataFrame", "shape": list(obj.shape)}
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
 
 # Configure logging
 logging.basicConfig(
@@ -196,10 +213,11 @@ class FactorStatusTracker:
         
         # Update stage results
         if stage_result:
+            sanitized = _sanitize_for_json(stage_result)
             if new_status in [FactorStatus.STAGE1_COMPLETED, FactorStatus.STAGE1_FAILED]:
-                update_fields['stage1_result'] = json.dumps(stage_result)
+                update_fields['stage1_result'] = json.dumps(sanitized, default=str)
             elif new_status in [FactorStatus.STAGE2_COMPLETED, FactorStatus.STAGE2_FAILED]:
-                update_fields['stage2_result'] = json.dumps(stage_result)
+                update_fields['stage2_result'] = json.dumps(sanitized, default=str)
             
             # Update best metrics if available
             if 'best_result' in stage_result:

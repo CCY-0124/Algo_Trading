@@ -363,7 +363,12 @@ class LocalDataLoader:
         """
         self.base_path = base_path
         self.price_filename = "market_price_usd_ohlc_tier2.csv"
-        
+
+        # In-process raw data cache: avoids repeated disk reads for the same
+        # (asset, factor_name) during a grid search session.
+        self._price_cache: Dict[str, pd.DataFrame] = {}
+        self._factor_cache: Dict[str, pd.DataFrame] = {}
+
         # Validate base path exists
         if not os.path.exists(base_path):
             logging.warning(f"Base path does not exist: {base_path}")
@@ -622,10 +627,15 @@ class LocalDataLoader:
         :param value_col: Name of value column (if None, will auto-detect)
         :return: DataFrame with 'timestamp' and 'value' columns, or None if failed
         """
+        cache_key = asset
+        if cache_key in self._price_cache:
+            logging.debug(f"Price cache hit: {asset}")
+            return self._price_cache[cache_key].copy()
+
         price_file = os.path.join(self.base_path, asset, self.price_filename)
-        
+
         logging.info(f"Loading price data for {asset} from: {price_file}")
-        
+
         try:
             # Load raw CSV
             df = pd.read_csv(price_file)
@@ -688,13 +698,14 @@ class LocalDataLoader:
             else:
                 logging.error(f"Failed to load price data for {asset}")
                 return None
-            
+
         except Exception as e:
             logging.error(f"Error loading price data from {price_file}: {e}")
             import traceback
             traceback.print_exc()
             return None
-        
+
+        self._price_cache[cache_key] = df.copy()
         return df
     
     def load_factor_data(self, asset: str, factor_name: str, clean_method: str = 'drop',
@@ -710,20 +721,26 @@ class LocalDataLoader:
         :param value_col: Name of value column (if None, will auto-detect)
         :return: DataFrame with 'timestamp' and 'value' columns, or None if failed
         """
+        cache_key = f"{asset}/{factor_name}"
+        if cache_key in self._factor_cache:
+            logging.debug(f"Factor cache hit: {cache_key}")
+            return self._factor_cache[cache_key].copy()
+
         factor_file = os.path.join(self.base_path, asset, f"{factor_name}.csv")
-        
+
         logging.info(f"Loading factor data for {asset}/{factor_name} from: {factor_file}")
-        
+
         df = self._load_csv_file(factor_file, clean_method=clean_method,
                                interactive=interactive, timestamp_col=timestamp_col, value_col=value_col)
-        
+
         if df is not None:
             logging.info(f"Successfully loaded factor data for {asset}/{factor_name}: {len(df)} records")
             logging.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
             logging.info(f"Value range: {df['value'].min():.2f} to {df['value'].max():.2f}")
+            self._factor_cache[cache_key] = df.copy()
         else:
             logging.error(f"Failed to load factor data for {asset}/{factor_name}")
-        
+
         return df
     
     def load_factor_data_by_param(self, asset: str, param_name: str, factor_name: str = None, 

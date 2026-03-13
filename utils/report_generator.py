@@ -609,9 +609,7 @@ class ReportGenerator:
         :param date_str: Date string
         """
         self.save_json_report(report, date_str)
-        self.save_text_report(report, date_str)
-        self.save_llm_analysis_report(report, date_str)
-        
+
         logging.info(f"All reports saved for {date_str}")
 
 

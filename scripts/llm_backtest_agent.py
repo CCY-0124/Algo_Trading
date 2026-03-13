@@ -82,11 +82,12 @@ class LLMBacktestAgent:
             param_method=self.config.get('param_method', 'pct_change')
         )
         
-        # LLM Client
+        # LLM Client (Jetson primary; Mac mini fallback when available)
         llm_config = self.config.get('llm', {})
         self.llm_client = LLMClient(
-            api_url=llm_config.get('api_url', 'http://localhost:11434/api/chat'),
-            model=llm_config.get('model', 'qwen2.5:3b')
+            api_url=llm_config.get('api_url', 'http://192.168.1.212:11434/api/chat'),
+            model=llm_config.get('model', 'qwen3.5:4b'),
+            fallback_urls=llm_config.get('fallback_urls', []),
         )
         
         # Context Manager
@@ -157,9 +158,9 @@ class LLMBacktestAgent:
         success = self.llm_client.test_connection()
         
         if success:
-            logging.info("✅ LLM connection successful")
+            logging.info("LLM connection successful")
         else:
-            logging.error("❌ LLM connection failed")
+            logging.error("LLM connection failed")
             logging.error("Please ensure Ollama is running on Jetson")
         
         return success
@@ -375,7 +376,8 @@ class LLMBacktestAgent:
                 'total_factors': len(all_results),
                 'promising_factors': 0,
                 'best_factor_id': None,
-                'best_sharpe': 0.0
+                'best_sharpe': 0.0,
+                'summary_data': {}
             }
         
         # Find best factor
@@ -439,16 +441,11 @@ class LLMBacktestAgent:
                 promising_factors=summary['promising_factors'],
                 best_factor_id=summary['best_factor_id'],
                 best_sharpe=summary['best_sharpe'],
-                summary_data=summary['summary_data']
+                summary_data=summary.get('summary_data', {})
             )
             
-            # Generate performance report
-            self.performance_monitor.print_report()
-            perf_report_file = f"reports/performance_{self.date_str}.json"
-            os.makedirs(os.path.dirname(perf_report_file), exist_ok=True)
-            self.performance_monitor.save_report(perf_report_file)
-            
             # Get performance statistics
+            self.performance_monitor.print_report()
             perf_stats = self.performance_monitor.get_all_stats()
             
             # Generate daily report
@@ -527,8 +524,9 @@ def load_config(config_path: str = None) -> Dict:
         'cache_size': 50,
         'use_llm_optimization': True,
         'llm': {
-            'api_url': 'http://localhost:11434/api/chat',
-            'model': 'qwen2.5:3b'
+            'api_url': 'http://192.168.1.212:11434/api/chat',
+            'model': 'qwen3.5:4b',
+            'fallback_urls': []
         }
     }
 

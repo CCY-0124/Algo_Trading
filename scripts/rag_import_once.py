@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 # Project root on path
@@ -20,7 +21,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Load .env so GEMINI_API_KEY or GOOGLE_EMBEDDING_API_KEY is available
 try:
     from dotenv import load_dotenv
     load_dotenv(PROJECT_ROOT / ".env")
@@ -29,7 +29,7 @@ except ImportError:
 
 from config.rag_config import get_rag_input_dir, get_chroma_dir, RAG_INPUT_DIR, RAG_CHROMA_DIR
 from core.rag.document_loader import discover_posts, load_rag_documents
-from core.rag.embedding_google import GoogleEmbeddingClient
+from core.rag.embedding_ollama import OllamaEmbeddingClient
 from core.rag.vector_store import RAGVectorStore
 
 logging.basicConfig(
@@ -75,18 +75,6 @@ def main():
         help="Full reimport: clear collection and embed all chunks (default: incremental, skip already imported)",
     )
     parser.add_argument(
-        "--api-batch-size",
-        type=int,
-        default=100,
-        help="Chunks per API request (limit is per request; 100 = ~140 requests for 14k chunks) (default: 100)",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.5,
-        help="Seconds between batch API requests (default: 0.5)",
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
         default=50,
@@ -96,7 +84,19 @@ def main():
         "--max-chunks-per-run",
         type=int,
         default=0,
-        help="Max chunks to embed this run (0 = no limit). Not needed when using batch API.",
+        help="Max chunks to embed this run (0 = no limit).",
+    )
+    parser.add_argument(
+        "--ollama-url",
+        type=str,
+        default=None,
+        help="Ollama base URL (default: env OLLAMA_BASE_URL or http://192.168.1.212:11434)",
+    )
+    parser.add_argument(
+        "--ollama-model",
+        type=str,
+        default="qwen3-embedding:8b",
+        help="Ollama embedding model (default: qwen3-embedding:8b)",
     )
     args = parser.parse_args()
 
@@ -140,12 +140,14 @@ def main():
         key = f"{meta.get('source_file', '')}_{meta.get('chunk_id', 0)}"
         return hashlib.sha256(key.encode()).hexdigest()[:24]
 
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_EMBEDDING_API_KEY")
-    if not api_key:
-        logging.error("GEMINI_API_KEY or GOOGLE_EMBEDDING_API_KEY is not set. Set one in .env to run import.")
-        sys.exit(1)
+    client = OllamaEmbeddingClient(
+        base_url=args.ollama_url,
+        model=args.ollama_model,
+        api_batch_size=10,
+        timeout=300,
+    )
+    logging.info("Using Ollama embedding: %s, model %s (batch %s, timeout 300s)", client.base_url, client.model, client.api_batch_size)
 
-    client = GoogleEmbeddingClient(api_batch_size=args.api_batch_size, delay_between_batches=args.delay)
     store = RAGVectorStore(persist_directory=args.chroma_dir)
 
     if args.full:
@@ -165,12 +167,10 @@ def main():
 
     if args.max_chunks_per_run > 0 and len(chunks_to_embed) > args.max_chunks_per_run:
         chunks_to_embed = chunks_to_embed[: args.max_chunks_per_run]
-        logging.info(
-            "Limiting to %s chunks this run (free tier ~1000/day). Rerun tomorrow without --full to continue.",
-            len(chunks_to_embed),
-        )
+        logging.info("Limiting to %s chunks this run. Rerun without --full to continue.", len(chunks_to_embed))
 
-    batch_size = max(1, args.batch_size)
+    batch_size = min(max(1, args.batch_size), 10)
+    logging.info("Ollama: using batch size %s per request.", batch_size)
     total = len(chunks_to_embed)
     for start in range(0, total, batch_size):
         batch = chunks_to_embed[start : start + batch_size]

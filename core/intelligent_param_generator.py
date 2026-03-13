@@ -11,7 +11,9 @@ Features:
 - Smart combination generation (~150 combinations)
 """
 
+import json
 import logging
+import re
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
@@ -193,55 +195,266 @@ class IntelligentParamGenerator:
                                    use_ai: bool = False) -> Dict:
         """
         Analyze factor and generate intelligent parameter space.
-        
-        Two approaches:
-        1. Simple min/max based (default): Fast, reliable, based on data range
-        2. AI-based (optional): Intelligent, adaptive, requires LLM
-        
+
+        Flow:
+        1. classify_factor  - decide param_method from factor name + stats (LLM or heuristic)
+        2. _build_grid_for_method - build long/short grid scaled to the chosen method
+        3. AI-based rolling/param-space (optional, use_ai=True only)
+
         :param asset: Asset symbol
         :param factor_name: Factor name
         :param factor_data: Factor data DataFrame
-        :param use_ai: Whether to use AI generation (default: False, use simple min/max)
+        :param use_ai: Whether to use LLM for rolling/param-space refinement (default False)
         :return: Parameter grid dictionary
         """
         logging.info(f"Analyzing factor characteristics: {asset}/{factor_name}")
-        
-        # Approach 1: Simple min/max based (default)
+
+        if factor_data is None or len(factor_data) == 0:
+            logging.warning("Empty factor data, using default params")
+            return self._generate_default_params()
+
+        # Step 0: Classify factor to decide param_method (LLM with heuristic fallback)
+        param_method = self.classify_factor(factor_name, factor_data)
+        logging.info(f"  Chosen param_method: {param_method}")
+
+        # Step 0.5: Build method-aware grid (correct scale for long/short thresholds)
+        param_grid = self._build_grid_for_method(param_method, factor_data)
+
         if not use_ai or not self.llm_client:
-            logging.info("Using simple min/max based parameter generation")
-            return self._generate_params_from_min_max(factor_data)
-        
-        # Approach 2: AI-based (optional)
-        logging.info("Using AI-based parameter generation")
-        
-        # Step 1: Analyze factor characteristics
+            param_grid = self._adjust_to_target_combinations(param_grid)
+            logging.info(f"Generated {self._count_combinations(param_grid)} combinations using method-aware grid")
+            return param_grid
+
+        # Optional AI refinement of rolling windows and param ranges
+        logging.info("Using AI-based parameter generation for refinement")
         characteristics = self.analyzer.analyze_factor_characteristics(factor_data)
-        
         if not characteristics:
-            logging.warning("Failed to analyze factor characteristics, using min/max method")
-            return self._generate_params_from_min_max(factor_data)
-        
-        # Step 2: Request LLM to generate parameter space
+            logging.warning("Failed to analyze factor characteristics, keeping method-aware grid")
+            return param_grid
+
         param_space = self._request_llm_param_generation(
             asset=asset,
             factor_name=factor_name,
             characteristics=characteristics
         )
-        
-        if not param_space:
-            logging.warning("LLM parameter generation failed, using min/max method")
-            return self._generate_params_from_min_max(factor_data)
-        
-        # Step 3: Generate parameter combinations
-        param_grid = self._generate_param_grid(param_space)
-        
-        # Step 4: Adjust to target combinations
-        param_grid = self._adjust_to_target_combinations(param_grid)
-        
-        num_combinations = self._count_combinations(param_grid)
-        logging.info(f"Generated parameter grid: {num_combinations} combinations")
-        
+        if param_space:
+            ai_grid = self._generate_param_grid(param_space)
+            # Keep param_method from classification; only adopt rolling/ranges from AI if valid
+            if 'param_method' in ai_grid:
+                ai_grid['param_method'] = [param_method]
+            param_grid = self._adjust_to_target_combinations(ai_grid)
+        else:
+            logging.warning("LLM refinement failed, keeping method-aware grid")
+            param_grid = self._adjust_to_target_combinations(param_grid)
+
+        logging.info(f"Generated parameter grid: {self._count_combinations(param_grid)} combinations")
         return param_grid
+
+    # ------------------------------------------------------------------
+    # Step 0: Factor Classification
+    # ------------------------------------------------------------------
+
+    def classify_factor(self, factor_name: str, factor_data: pd.DataFrame) -> str:
+        """
+        Decide the best param_method for this factor.
+
+        Priority order:
+        1. LLM suggestion (if llm_client available) - based on name + stats summary only
+        2. Heuristic fallback - deterministic rules on raw-value statistics
+
+        Returns one of: 'pct_change', 'zscore', 'ratio_ma', 'minmax', 'raw', 'absolute'
+
+        :param factor_name: Factor name string (used as semantic hint for LLM)
+        :param factor_data: DataFrame with 'value' column
+        :return: param_method string
+        """
+        VALID_METHODS = {'pct_change', 'zscore', 'ratio_ma', 'minmax', 'raw', 'absolute'}
+
+        values = factor_data['value'].dropna() if factor_data is not None else pd.Series([], dtype=float)
+
+        # Always try LLM first when available
+        if self.llm_client and len(values) > 0:
+            llm_method = self._classify_factor_via_llm(factor_name, values)
+            if llm_method and llm_method in VALID_METHODS:
+                logging.info(f"  LLM classification -> {llm_method}")
+                return llm_method
+            logging.info("  LLM classification unavailable or invalid, falling back to heuristic")
+
+        return self._classify_factor_heuristic(values)
+
+    def _classify_factor_via_llm(self, factor_name: str, values: pd.Series) -> Optional[str]:
+        """
+        Ask LLM to classify factor - sends only name + statistical summary, no backtest results.
+        Returns param_method string or None on failure.
+        """
+        stats = {
+            'min': float(values.min()),
+            'max': float(values.max()),
+            'mean': float(values.mean()),
+            'std': float(values.std()),
+            'first_5': [round(float(v), 4) for v in values.head(5).tolist()],
+            'last_5':  [round(float(v), 4) for v in values.tail(5).tolist()],
+        }
+
+        prompt = f"""You are a quant analyst. Given the factor name and its raw data statistics below,
+decide the best normalization method for use in a backtesting signal.
+
+Factor name: {factor_name}
+Raw value stats:
+  min={stats['min']:.4f}, max={stats['max']:.4f}, mean={stats['mean']:.4f}, std={stats['std']:.4f}
+First 5 values: {stats['first_5']}
+Last  5 values: {stats['last_5']}
+
+Choose EXACTLY ONE method from this list and explain why IN ONE SENTENCE:
+- pct_change : relative change (x_t - x_(t-1)) / x_(t-1). Good for SOPR-like ratios, bounded metrics.
+- zscore     : (value - rolling_mean) / rolling_std. Best for level/trend data (addresses, balance, counts).
+- ratio_ma   : value / rolling_mean. Good for volume, activity data. Output is a ratio around 1.0.
+- minmax     : (value - rolling_min) / (rolling_max - rolling_min). Good for oscillators, bounded indicators.
+- raw        : raw value directly. Only if already bounded (e.g. -1 to 1, 0 to 1).
+- absolute   : diff(value). Rarely preferred; only for already-stationary level data.
+
+DECISION RULE: Do NOT choose based on backtest results. Choose purely from the nature of the data.
+
+Respond in JSON only:
+{{"param_method": "<method>", "reason": "<one sentence>"}}"""
+
+        messages = [
+            {"role": "system", "content": "You are a quantitative analyst. Answer in JSON only, no extra text."},
+            {"role": "user",   "content": prompt}
+        ]
+
+        try:
+            response = self.llm_client._make_request(messages, temperature=0.1, max_tokens=200)
+            if not response or not response.get('content'):
+                return None
+
+            text = response['content'].strip()
+            json_match = re.search(r'\{.*?\}', text, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                method = parsed.get('param_method', '').strip().lower()
+                reason = parsed.get('reason', '')
+                logging.info(f"  LLM reason: {reason}")
+                return method
+        except Exception as e:
+            logging.warning(f"  LLM classification error: {e}")
+
+        return None
+
+    def _classify_factor_heuristic(self, values: pd.Series) -> str:
+        """
+        Heuristic fallback: decide param_method from raw value statistics alone.
+        Uses the decision tree from the framework:
+          - Bounded [-1.5, 1.5] or [0, 105]  → raw
+          - Has upward trend (level data)      → zscore
+          - Otherwise                          → pct_change (safe default)
+        """
+        if len(values) == 0:
+            return 'pct_change'
+
+        vmin = float(values.min())
+        vmax = float(values.max())
+
+        # Already bounded: sentiment scores, correlations, SOPR ~1
+        if vmin >= -1.5 and vmax <= 1.5:
+            return 'raw'
+        if vmin >= 0 and vmax <= 105:
+            return 'raw'
+
+        # Detect long-term upward trend: compare first-quarter mean vs last-quarter mean
+        n = len(values)
+        q = max(1, n // 4)
+        first_mean = float(values.iloc[:q].mean())
+        last_mean  = float(values.iloc[-q:].mean())
+        has_trend = (first_mean != 0) and (abs(last_mean / first_mean) > 1.2 or abs(last_mean / first_mean) < 0.83)
+
+        if has_trend:
+            return 'zscore'
+
+        return 'pct_change'
+
+    # ------------------------------------------------------------------
+    # Step 0.5: Method-Aware Grid Building
+    # ------------------------------------------------------------------
+
+    def _build_grid_for_method(self, param_method: str, factor_data: pd.DataFrame) -> Dict:
+        """
+        Build param grid with long_param / short_param ranges correct for the chosen method.
+
+        Each method produces rolling_return in a well-defined scale:
+          pct_change  → ~ -0.1 to 0.1
+          zscore      → ~ -3   to 3
+          ratio_ma    → ~ 0.7  to 1.3
+          minmax      → 0 to 1
+          raw         → raw factor scale (uses rolling-mean percentiles)
+          absolute    → diff scale (uses diff percentiles)
+
+        :param param_method: One of the valid method strings
+        :param factor_data: DataFrame with 'value' column
+        :return: Parameter grid dict
+        """
+        rolling = [1, 3, 5, 7, 10, 14, 20, 30, 50]
+
+        if param_method == 'zscore':
+            long_param  = [-2.0, -1.5, -1.0, -0.5,  0.0]
+            short_param = [ 0.0,  0.5,  1.0,  1.5,  2.0]
+
+        elif param_method == 'ratio_ma':
+            long_param  = [0.80, 0.85, 0.90, 0.95, 1.00]
+            short_param = [1.00, 1.05, 1.10, 1.15, 1.20]
+
+        elif param_method == 'minmax':
+            long_param  = [0.10, 0.20, 0.30, 0.40, 0.50]
+            short_param = [0.50, 0.60, 0.70, 0.80, 0.90]
+
+        elif param_method in ('pct_change', 'absolute'):
+            # Use pct_change stats for pct_change; diff stats for absolute
+            values = factor_data['value'].dropna() if factor_data is not None else pd.Series([], dtype=float)
+            if param_method == 'pct_change':
+                series = values.pct_change().dropna()
+            else:
+                series = values.diff().dropna()
+
+            if len(series) > 5:
+                q10 = float(series.quantile(0.10))
+                q25 = float(series.quantile(0.25))
+                q75 = float(series.quantile(0.75))
+                q90 = float(series.quantile(0.90))
+                mid = float(series.median())
+                # long: signal triggers when factor is LOW (below threshold)
+                long_param  = sorted(set([round(q10, 4), round(q25, 4), round(mid, 4)]))
+                # short: signal triggers when factor is HIGH (above threshold)
+                short_param = sorted(set([round(mid, 4), round(q75, 4), round(q90, 4)]))
+            else:
+                long_param  = [-0.05, -0.02, -0.01, 0.0,  0.01]
+                short_param = [-0.01,  0.0,   0.01, 0.02, 0.05]
+
+        elif param_method == 'raw':
+            # Use rolling-mean distribution as signal; thresholds are percentiles of raw values
+            values = factor_data['value'].dropna() if factor_data is not None else pd.Series([], dtype=float)
+            if len(values) > 5:
+                q10 = float(values.quantile(0.10))
+                q25 = float(values.quantile(0.25))
+                q75 = float(values.quantile(0.75))
+                q90 = float(values.quantile(0.90))
+                mid = float(values.median())
+                long_param  = sorted(set([round(q10, 4), round(q25, 4), round(mid, 4)]))
+                short_param = sorted(set([round(mid, 4), round(q75, 4), round(q90, 4)]))
+            else:
+                long_param  = [-0.05, -0.02, 0.0]
+                short_param = [ 0.0,   0.02, 0.05]
+
+        else:
+            # Ultimate fallback: safe pct_change grid
+            long_param  = [-0.05, -0.02, -0.01, 0.0,  0.01]
+            short_param = [-0.01,  0.0,   0.01, 0.02, 0.05]
+
+        return {
+            'rolling':      rolling,
+            'long_param':   long_param,
+            'short_param':  short_param,
+            'param_method': [param_method],
+        }
     
     def _request_llm_param_generation(self,
                                      asset: str,
@@ -482,19 +695,13 @@ Answer only in JSON, no other text."""
             pct_std = abs(pct_stats.get('pct_std', 0.05))
             pct_mean = pct_stats.get('pct_mean', 0)
             
-            # Adjust ranges based on typical change magnitude
-            if typical_pct_change > 0:
-                # Use typical change as reference
-                long_min = min(pct_mean - 5 * typical_pct_change, -0.3)
-                long_max = max(pct_mean - 0.5 * typical_pct_change, -0.01)
-                short_min = max(pct_mean + 0.5 * typical_pct_change, 0.01)
-                short_max = min(pct_mean + 5 * typical_pct_change, 0.3)
-            else:
-                # Fallback to std-based calculation
-                long_min = min(pct_mean - 3 * pct_std, -0.3)
-                long_max = max(pct_mean - 0.5 * pct_std, -0.01)
-                short_min = max(pct_mean + 0.5 * pct_std, 0.01)
-                short_max = min(pct_mean + 3 * pct_std, 0.3)
+            # Full symmetric range around mean, no directional assumption
+            # long_param: lower half; short_param: upper half
+            spread = 3 * pct_std if pct_std > 0 else 3 * typical_pct_change if typical_pct_change > 0 else 0.1
+            long_min = pct_mean - spread
+            long_max = pct_mean
+            short_min = pct_mean
+            short_max = pct_mean + spread
             
             # Adjust step size based on volatility
             if volatility_level == 'low':
@@ -525,17 +732,17 @@ Answer only in JSON, no other text."""
             abs_std = abs(abs_stats.get('abs_std', 100))
             abs_mean = abs_stats.get('abs_mean', 0)
             
-            # Adjust based on typical absolute change
-            if typical_abs_change > 0:
-                long_min = min(abs_mean - 5 * typical_abs_change, -abs_std * 3)
-                long_max = max(abs_mean - 0.5 * typical_abs_change, -abs_std * 0.1)
-                short_min = max(abs_mean + 0.5 * typical_abs_change, abs_std * 0.1)
-                short_max = min(abs_mean + 5 * typical_abs_change, abs_std * 3)
-            else:
-                long_min = min(abs_mean - 3 * abs_std, -abs_std * 2)
-                long_max = max(abs_mean - 0.5 * abs_std, -abs_std * 0.1)
-                short_min = max(abs_mean + 0.5 * abs_std, abs_std * 0.1)
-                short_max = min(abs_mean + 3 * abs_std, abs_std * 2)
+            # Full symmetric range around mean, no directional assumption
+            # long_param: lower half; short_param: upper half
+            # Both can be negative, both positive, or mixed
+            range_low = abs_mean - 3 * abs_std
+            range_high = abs_mean + 3 * abs_std
+            midpoint = abs_mean
+
+            long_min = range_low
+            long_max = midpoint
+            short_min = midpoint
+            short_max = range_high
             
             # Adjust step based on scale
             if scale_hint == 'small_positive':
@@ -755,29 +962,28 @@ Answer only in JSON, no other text."""
                 # Fallback to default range
                 short_param = [0.01, 0.02, 0.03, 0.05, 0.08, 0.1, 0.12, 0.15, 0.2, 0.3]
         else:
-            # For absolute-based: use reasonable range
-            reasonable_min = max(data_min, data_mean - 3 * data_std)
-            reasonable_max = min(data_max, data_mean + 3 * data_std)
-            
-            long_max = min(0, reasonable_max) if reasonable_max < 0 else -abs(data_std * 0.1)
-            long_min = max(reasonable_min, reasonable_min * 0.5)
-            
-            short_min = max(0, reasonable_min) if reasonable_min > 0 else abs(data_std * 0.1)
-            short_max = min(reasonable_max, reasonable_max * 0.5)
-            
+            # For absolute-based: rolling_return = diff(factor).rolling(window).mean()
+            # Use diff statistics to match the actual signal distribution
+            diff_values = values.diff().dropna()
+            diff_std = float(diff_values.std()) if len(diff_values) > 1 else data_std * 0.01
+            diff_mean = float(diff_values.mean()) if len(diff_values) > 1 else 0.0
+
+            # Full symmetric range: mean ± 3*std, no directional assumption
+            range_low = diff_mean - 3 * diff_std
+            range_high = diff_mean + 3 * diff_std
+            midpoint = diff_mean
+
             num_params = 10
-            
-            if long_min < long_max:
-                long_param = np.linspace(long_min, long_max, num_params).tolist()
-                long_param = [round(x, 2) for x in long_param]
-            else:
-                long_param = [-1000, -800, -600, -400, -200, -100, -50, -20, -10, -5]
-            
-            if short_min < short_max:
-                short_param = np.linspace(short_min, short_max, num_params).tolist()
-                short_param = [round(x, 2) for x in short_param]
-            else:
-                short_param = [5, 10, 20, 50, 100, 200, 400, 600, 800, 1000]
+
+            # long_param: lower half of the range (below midpoint)
+            # short_param: upper half of the range (above midpoint)
+            # This guarantees long_param < short_param (required for signal logic)
+            # but allows both to be negative, both positive, or mixed
+            long_param = np.linspace(range_low, midpoint, num_params + 1)[:-1].tolist()
+            long_param = [round(x, 4) for x in long_param]
+
+            short_param = np.linspace(midpoint, range_high, num_params + 1)[1:].tolist()
+            short_param = [round(x, 4) for x in short_param]
         
         param_grid = {
             'rolling': rolling,

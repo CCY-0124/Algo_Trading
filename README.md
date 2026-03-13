@@ -31,6 +31,7 @@ Algo_Trading/
 │   ├── paths.py                  # Path configuration
 │   ├── trading_config.py         # Trading configuration
 │   ├── download_config.py        # Download rate limiting configuration
+│   ├── rag_config.py             # RAG paths and embedding API (env overrides)
 │   └── secrets.py                # Encrypted API key management
 ├── core/                         # Core engine components
 │   ├── __init__.py               # Core module entry
@@ -42,19 +43,28 @@ Algo_Trading/
 │   ├── intelligent_param_generator.py  # LLM-powered parameter generation
 │   ├── performance_monitor.py    # Performance monitoring
 │   ├── data_cache.py             # Lightweight data caching
-│   └── factor_status_tracker.py  # Factor status tracking
+│   ├── factor_status_tracker.py  # Factor status tracking
+│   └── rag/                      # RAG (retrieval-augmented generation)
+│       ├── __init__.py           # RAG module entry
+│       ├── document_loader.py    # Load and chunk documents from RAG_input
+│       ├── vector_store.py       # Chroma vector store wrapper
+│       └── embedding_ollama.py   # Ollama embedding client (local)
 ├── scripts/                      # Executable scripts
 │   ├── daily_download.py         # Daily data downloader
 │   ├── interactive_trading.py    # Interactive trading interface
 │   ├── llm_backtest_agent.py     # Automated LLM backtest agent
 │   ├── llm_orchestrator.py       # LLM workflow orchestrator
-│   ├── schedule_daily_agent.py  # Windows task scheduler helper
-│   └── setup_environment.py     # Environment setup
-├── tools/                        # One-time setup and utility scripts
+│   ├── schedule_daily_agent.py   # Windows task scheduler helper
+│   ├── setup_environment.py      # Environment setup
+│   ├── rag_import_once.py        # One-time RAG import (RAG_input to Chroma)
+│   └── rag_ui.py                 # Streamlit UI for RAG knowledge base search
+├── tools/                        # One-time setup and utility scripts (testing, verification)
 │   ├── generate_metadata_catalog.py  # Metadata catalog generation
 │   ├── legacy_algorithm.py       # Legacy algorithm (for verification)
 │   ├── simple_price_check.py    # API connectivity test
-│   └── simple_optimization.py   # Quick parameter testing
+│   ├── simple_optimization.py   # Quick parameter testing
+│   ├── run_compare_grid_once.py # Run compare grid once (non-interactive, testing)
+│   └── run_llm_single_factor.py # Run single factor through LLM pipeline only (testing)
 ├── strategies/                   # Trading strategies
 │   ├── __init__.py               # Strategies module entry
 │   └── enhanced_non_price_strategy.py  # Enhanced non-price strategy
@@ -148,6 +158,20 @@ python scripts/daily_download.py
 python tools/simple_price_check.py
 ```
 
+### RAG (Retrieval-Augmented Generation)
+The project includes an optional RAG pipeline for document ingestion and search. Documents live under `RAG_input/` (one folder per author; `post/` for .txt and optional `scripts/` for .py). The vector store is written to `chroma_db/` (gitignored).
+
+```bash
+# One-time import: load documents from RAG_input into Chroma
+python scripts/rag_import_once.py
+# Options: --skip-embedding (discover only), --full (clear and reimport)
+
+# Streamlit UI for RAG knowledge base search (Ollama embedding)
+streamlit run scripts/rag_ui.py
+```
+
+Configure paths via `config/rag_config.py` or env: `RAG_INPUT_DIR`, `RAG_CHROMA_DIR`.
+
 ### Generate Metadata Catalog
 ```bash
 # Generate metadata catalog (one-time setup)
@@ -212,6 +236,12 @@ python tools/simple_optimization.py
 
 # Legacy algorithm verification
 python tools/legacy_algorithm.py
+
+# Run compare grid once (non-interactive, for testing)
+python tools/run_compare_grid_once.py [factor_name]
+
+# Run single factor through LLM pipeline only (testing)
+python tools/run_llm_single_factor.py [factor_name] [--fixed-grid]
 ```
 
 **Tool Purposes:**
@@ -219,6 +249,8 @@ python tools/legacy_algorithm.py
 - **`tools/legacy_algorithm.py`** - Legacy algorithm file to ensure logic and results match the old system
 - **`tools/simple_price_check.py`** - Verify API connectivity and check current prices
 - **`tools/generate_metadata_catalog.py`** - Generate metadata catalog from Glassnode API
+- **`tools/run_compare_grid_once.py`** - Run compare grid (option 5) once with fixed inputs, no prompts (testing)
+- **`tools/run_llm_single_factor.py`** - Run one factor through LLM pipeline only; optional `--fixed-grid` for same param grid as compare (testing)
 
 ## Live Trading
 
@@ -309,6 +341,11 @@ python scripts/schedule_daily_agent.py
 - **Context Manager** (`core/context_manager.py`) - Context management
 - **Parameter Generator** (`core/intelligent_param_generator.py`) - LLM-powered parameter generation
 
+### RAG Components
+- **Document Loader** (`core/rag/document_loader.py`) - Discover and load documents from RAG_input
+- **Vector Store** (`core/rag/vector_store.py`) - Chroma vector store wrapper
+- **Embeddings** (`core/rag/embedding_ollama.py`) - Ollama (local) embedding client
+
 ### Trading Interface (`trading/`)
 - Bybit exchange integration
 - Order management and execution
@@ -326,7 +363,8 @@ python scripts/schedule_daily_agent.py
 - `config/download_config.py` - Download rate limiting configuration
 - `config/trading_config.py` - Trading configuration
 - `config/paths.py` - Path configuration
-- `config/llm_agent_config.json` - LLM agent configuration (if using LLM features)
+- `config/rag_config.py` - RAG paths (env: RAG_INPUT_DIR, RAG_CHROMA_DIR)
+- `config/llm_agent_config.json` - LLM agent configuration (if using LLM features; user-specific, gitignored)
 
 ### Data Paths
 - Default data storage: `D:\Trading_Data\glassnode_data2`
@@ -387,6 +425,7 @@ For issues and questions:
 
 ## Updates
 
+- **v2.3** - RAG pipeline (document import, Chroma vector store, Streamlit search UI); scripts: rag_import_once, rag_ui; tools: run_compare_grid_once, run_llm_single_factor (testing)
 - **v2.2** - Code optimization and reorganization (Phase 1 & 2)
 - **v2.1** - Enhanced optimization system with LLM integration
 - **v2.0** - Enhanced data downloader with session management

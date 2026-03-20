@@ -790,7 +790,7 @@ class TwoStageFactorScreening:
                     historical_context,
                     factor_data=factor_data,
                     stage1_results=stage1_results,
-                    max_iterations=5,
+                    max_iterations=3,
                     min_improvement=0.01
                 )
                 

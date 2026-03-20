@@ -192,7 +192,7 @@ class IntelligentParamGenerator:
                                    asset: str,
                                    factor_name: str,
                                    factor_data: pd.DataFrame,
-                                   use_ai: bool = False) -> Dict:
+                                   use_ai: bool = False) -> Tuple[Dict, str]:
         """
         Analyze factor and generate intelligent parameter space.
 
@@ -205,16 +205,16 @@ class IntelligentParamGenerator:
         :param factor_name: Factor name
         :param factor_data: Factor data DataFrame
         :param use_ai: Whether to use LLM for rolling/param-space refinement (default False)
-        :return: Parameter grid dictionary
+        :return: (parameter grid dictionary, method_reason string)
         """
         logging.info(f"Analyzing factor characteristics: {asset}/{factor_name}")
 
         if factor_data is None or len(factor_data) == 0:
             logging.warning("Empty factor data, using default params")
-            return self._generate_default_params()
+            return (self._generate_default_params(), '')
 
         # Step 0: Classify factor to decide param_method (LLM with heuristic fallback)
-        param_method = self.classify_factor(factor_name, factor_data)
+        param_method, method_reason = self.classify_factor(factor_name, factor_data)
         logging.info(f"  Chosen param_method: {param_method}")
 
         # Step 0.5: Build method-aware grid (correct scale for long/short thresholds)
@@ -223,14 +223,14 @@ class IntelligentParamGenerator:
         if not use_ai or not self.llm_client:
             param_grid = self._adjust_to_target_combinations(param_grid)
             logging.info(f"Generated {self._count_combinations(param_grid)} combinations using method-aware grid")
-            return param_grid
+            return (param_grid, method_reason)
 
         # Optional AI refinement of rolling windows and param ranges
         logging.info("Using AI-based parameter generation for refinement")
         characteristics = self.analyzer.analyze_factor_characteristics(factor_data)
         if not characteristics:
             logging.warning("Failed to analyze factor characteristics, keeping method-aware grid")
-            return param_grid
+            return (param_grid, method_reason)
 
         param_space = self._request_llm_param_generation(
             asset=asset,
@@ -239,7 +239,6 @@ class IntelligentParamGenerator:
         )
         if param_space:
             ai_grid = self._generate_param_grid(param_space)
-            # Keep param_method from classification; only adopt rolling/ranges from AI if valid
             if 'param_method' in ai_grid:
                 ai_grid['param_method'] = [param_method]
             param_grid = self._adjust_to_target_combinations(ai_grid)
@@ -248,13 +247,13 @@ class IntelligentParamGenerator:
             param_grid = self._adjust_to_target_combinations(param_grid)
 
         logging.info(f"Generated parameter grid: {self._count_combinations(param_grid)} combinations")
-        return param_grid
+        return (param_grid, method_reason)
 
     # ------------------------------------------------------------------
     # Step 0: Factor Classification
     # ------------------------------------------------------------------
 
-    def classify_factor(self, factor_name: str, factor_data: pd.DataFrame) -> str:
+    def classify_factor(self, factor_name: str, factor_data: pd.DataFrame) -> Tuple[str, str]:
         """
         Decide the best param_method for this factor.
 
@@ -262,30 +261,30 @@ class IntelligentParamGenerator:
         1. LLM suggestion (if llm_client available) - based on name + stats summary only
         2. Heuristic fallback - deterministic rules on raw-value statistics
 
-        Returns one of: 'pct_change', 'zscore', 'ratio_ma', 'minmax', 'raw', 'absolute'
+        Returns (param_method string, reason string). Reason is from LLM or empty for heuristic.
 
         :param factor_name: Factor name string (used as semantic hint for LLM)
         :param factor_data: DataFrame with 'value' column
-        :return: param_method string
+        :return: (param_method, method_reason)
         """
         VALID_METHODS = {'pct_change', 'zscore', 'ratio_ma', 'minmax', 'raw', 'absolute'}
 
         values = factor_data['value'].dropna() if factor_data is not None else pd.Series([], dtype=float)
 
-        # Always try LLM first when available
         if self.llm_client and len(values) > 0:
-            llm_method = self._classify_factor_via_llm(factor_name, values)
+            llm_method, llm_reason = self._classify_factor_via_llm(factor_name, values)
             if llm_method and llm_method in VALID_METHODS:
                 logging.info(f"  LLM classification -> {llm_method}")
-                return llm_method
+                return (llm_method, llm_reason)
             logging.info("  LLM classification unavailable or invalid, falling back to heuristic")
 
-        return self._classify_factor_heuristic(values)
+        method = self._classify_factor_heuristic(values)
+        return (method, '')
 
-    def _classify_factor_via_llm(self, factor_name: str, values: pd.Series) -> Optional[str]:
+    def _classify_factor_via_llm(self, factor_name: str, values: pd.Series) -> Tuple[Optional[str], str]:
         """
         Ask LLM to classify factor - sends only name + statistical summary, no backtest results.
-        Returns param_method string or None on failure.
+        Returns (param_method string or None on failure, reason string).
         """
         stats = {
             'min': float(values.min()),
@@ -326,7 +325,7 @@ Respond in JSON only:
         try:
             response = self.llm_client._make_request(messages, temperature=0.1, max_tokens=200)
             if not response or not response.get('content'):
-                return None
+                return (None, '')
 
             text = response['content'].strip()
             json_match = re.search(r'\{.*?\}', text, re.DOTALL)
@@ -335,11 +334,11 @@ Respond in JSON only:
                 method = parsed.get('param_method', '').strip().lower()
                 reason = parsed.get('reason', '')
                 logging.info(f"  LLM reason: {reason}")
-                return method
+                return (method, reason)
         except Exception as e:
             logging.warning(f"  LLM classification error: {e}")
 
-        return None
+        return (None, '')
 
     def _classify_factor_heuristic(self, values: pd.Series) -> str:
         """

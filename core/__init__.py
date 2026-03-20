@@ -9,7 +9,7 @@ from .llm_client import LLMClient
 from .context_manager import ContextManager
 from .performance_monitor import PerformanceMonitor, get_monitor
 from .llm_scheduler import IntelligentLLMScheduler
-from .data_cache import LightweightDataCache, get_cache
+from .data_cache import LightweightDataCache
 from .intelligent_param_generator import IntelligentParamGenerator, FactorAnalyzer
 from .factor_status_tracker import FactorStatusTracker, FactorStatus, get_status_tracker
 
@@ -24,7 +24,6 @@ __all__ = [
     'get_monitor',
     'IntelligentLLMScheduler',
     'LightweightDataCache',
-    'get_cache',
     'IntelligentParamGenerator',
     'FactorAnalyzer',
     'FactorStatusTracker',

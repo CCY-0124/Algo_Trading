@@ -452,91 +452,6 @@ Factor {factor_id} Historical Summary:
         self.conn.commit()
         logging.info(f"Saved daily summary for {date}")
     
-    def get_daily_summary(self, date: str) -> Optional[Dict]:
-        """
-        Get daily summary.
-        
-        :param date: Date string (YYYY-MM-DD)
-        :return: Daily summary dictionary or None
-        """
-        cursor = self.conn.cursor()
-        
-        cursor.execute("""
-        SELECT * FROM daily_summary WHERE date = ?
-        """, (date,))
-        
-        row = cursor.fetchone()
-        if row:
-            return dict(row)
-        return None
-    
-    def get_top_factors(self, limit: int = 10, min_sharpe: float = 0.0) -> List[Dict]:
-        """
-        Get top performing factors.
-        
-        :param limit: Maximum number of factors to return
-        :param min_sharpe: Minimum Sharpe ratio threshold
-        :return: List of top factors
-        """
-        cursor = self.conn.cursor()
-        
-        cursor.execute("""
-        SELECT * FROM factor_context 
-        WHERE best_sharpe >= ?
-        ORDER BY best_sharpe DESC
-        LIMIT ?
-        """, (min_sharpe, limit))
-        
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
-    
-    def export_to_json(self, output_path: str, factor_ids: List[str] = None):
-        """
-        Export context data to JSON file.
-        
-        :param output_path: Output file path
-        :param factor_ids: List of factor IDs to export (None = all)
-        """
-        export_data = {
-            'export_date': datetime.now().isoformat(),
-            'factors': [],
-            'daily_summaries': []
-        }
-        
-        if factor_ids:
-            for factor_id in factor_ids:
-                context = self.get_factor_context(factor_id)
-                if context:
-                    history = self.get_analysis_history(factor_id, limit=100)
-                    export_data['factors'].append({
-                        'context': context,
-                        'history': history
-                    })
-        else:
-            # Export all factors
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT factor_id FROM factor_context")
-            all_factor_ids = [row[0] for row in cursor.fetchall()]
-            
-            for factor_id in all_factor_ids:
-                context = self.get_factor_context(factor_id)
-                if context:
-                    history = self.get_analysis_history(factor_id, limit=100)
-                    export_data['factors'].append({
-                        'context': context,
-                        'history': history
-                    })
-        
-        # Export daily summaries
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM daily_summary ORDER BY date DESC LIMIT 30")
-        export_data['daily_summaries'] = [dict(row) for row in cursor.fetchall()]
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(export_data, f, indent=2, ensure_ascii=False, default=str)
-        
-        logging.info(f"Exported context data to {output_path}")
-    
     def close(self):
         """
         Close database connection.
@@ -609,29 +524,7 @@ if __name__ == "__main__":
         summary = cm.get_factor_summary("BTC_sopr")
         print(f"   Summary:\n{summary}")
         
-        # Test: Save daily summary
-        print("6. Testing save_daily_summary...")
-        cm.save_daily_summary(
-            date="2025-01-15",
-            total_factors=100,
-            promising_factors=15,
-            best_factor_id="BTC_sopr",
-            best_sharpe=1.8,
-            summary_data={"test": "data"}
-        )
-        
-        # Test: Get top factors
-        print("7. Testing get_top_factors...")
-        top_factors = cm.get_top_factors(limit=5)
-        print(f"   Top factors: {len(top_factors)}")
-        
-        # Test: Export to JSON
-        print("8. Testing export_to_json...")
-        export_path = tempfile.mktemp(suffix='.json')
-        cm.export_to_json(export_path, factor_ids=["BTC_sopr"])
-        print(f"   Exported to: {export_path}")
-    
-    print("\n✅ All tests passed!")
+    print("\nAll tests passed!")
     
     # Cleanup
     os.remove(test_db)

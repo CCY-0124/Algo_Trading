@@ -18,6 +18,8 @@ import json
 import logging
 import time
 import re
+import threading
+import queue
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -61,7 +63,7 @@ class LLMClient:
     
     def __init__(self,
                  api_url: str = "http://localhost:11434/api/chat",
-                 model: str = "qwen2.5:3b",
+                 model: str = "qwen3.5:2b",
                  timeout: int = 120,
                  max_retries: int = 3,
                  retry_delay: float = 2.0,
@@ -95,15 +97,125 @@ class LLMClient:
         logging.info(f"  Model: {model}")
         logging.info(f"  Timeout: {timeout}s")
     
-    def _make_request(self, messages: List[Dict], temperature: float = 0.3, 
-                     max_tokens: int = 2000) -> Optional[Dict]:
+    def _make_request_streaming(
+        self,
+        current_url: str,
+        payload: Dict,
+        headers: Dict,
+        stream_stuck_seconds: int = 60,
+        wall_clock_limit: int = 300,
+    ) -> Optional[Dict]:
         """
-        Make HTTP request to Ollama API with retry mechanism.
-        
-        :param messages: List of message dicts with 'role' and 'content'
-        :param temperature: Sampling temperature
-        :param max_tokens: Maximum tokens to generate
-        :return: Response dictionary or None if failed
+        Send request with stream=True and two layers of timeout protection:
+        1. stream_stuck_seconds: abort if no chunk arrives within this window (resettable)
+        2. wall_clock_limit: absolute hard cutoff from request start (non-resettable)
+
+        Returns parsed response dict or None on any failure.
+        """
+        payload = {**payload, "stream": True}
+        request_start = time.monotonic()
+        content_parts = []
+        model_name = self.model
+        line_queue = queue.Queue()
+        stream_error = []
+
+        def read_stream():
+            try:
+                with requests.post(
+                    current_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=(10, 90),
+                    stream=True,
+                ) as response:
+                    if response.status_code != 200:
+                        stream_error.append(("HTTP %s" % response.status_code,))
+                        line_queue.put(None)
+                        return
+                    for line in response.iter_lines(decode_unicode=True):
+                        if line is not None:
+                            line_queue.put(line)
+                    line_queue.put(None)
+            except Exception as e:
+                stream_error.append(e)
+                line_queue.put(None)
+
+        reader = threading.Thread(target=read_stream, daemon=True)
+        reader.start()
+
+        try:
+            while True:
+                elapsed = time.monotonic() - request_start
+                if elapsed >= wall_clock_limit:
+                    logging.error(
+                        "Wall-clock limit reached: %.0fs >= %ds. Force-aborting LLM request.",
+                        elapsed, wall_clock_limit,
+                    )
+                    return None
+
+                remaining = min(stream_stuck_seconds, wall_clock_limit - elapsed)
+                try:
+                    line = line_queue.get(timeout=max(remaining, 1))
+                except queue.Empty:
+                    if time.monotonic() - request_start >= wall_clock_limit:
+                        logging.error(
+                            "Wall-clock limit reached: %ds. Force-aborting LLM request.",
+                            wall_clock_limit,
+                        )
+                    else:
+                        logging.warning(
+                            "LLM stream stuck: no chunk for %ds. Aborting request.",
+                            stream_stuck_seconds,
+                        )
+                    return None
+                if line is None:
+                    if stream_error:
+                        e = stream_error[0]
+                        if isinstance(e, Exception):
+                            raise e
+                        logging.error("LLM API error: %s", e[0] if isinstance(e, (list, tuple)) else e)
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = obj.get("message", {})
+                part = msg.get("content") or msg.get("response")
+                if part:
+                    content_parts.append(part)
+                model_name = obj.get("model", model_name)
+                if obj.get("done", False):
+                    break
+            if stream_error:
+                return None
+            content = "".join(content_parts)
+            elapsed = time.monotonic() - request_start
+            logging.info("LLM request completed in %.1fs (streaming)", elapsed)
+            return {
+                "content": content,
+                "model": model_name,
+                "done": True,
+            }
+        except requests.exceptions.Timeout:
+            logging.error(
+                "Request timeout (%s). LLM may be overloaded or stuck.",
+                current_url,
+            )
+            return None
+        except requests.exceptions.ConnectionError:
+            raise
+        except Exception as e:
+            logging.error("Stream request error: %s", e)
+            return None
+
+    def _make_request(self, messages: List[Dict], temperature: float = 0.3,
+                      max_tokens: int = 2000,
+                      stream_stuck_seconds: int = 60,
+                      wall_clock_limit: int = 300) -> Optional[Dict]:
+        """
+        Make HTTP request to Ollama API with streaming and retry.
+        Uses streaming to detect no response; retries up to max_retries then stops.
+        wall_clock_limit is an absolute hard cutoff per attempt (default 5 min).
         """
         payload = {
             "model": self.model,
@@ -112,63 +224,53 @@ class LLMClient:
                 "temperature": temperature,
                 "num_predict": max_tokens
             },
-            "stream": False,
             "think": False
         }
-        
         headers = {"Content-Type": "application/json"}
 
-        # Try each endpoint in order; move to next on connection failure
         for ep_idx in range(self._active_endpoint_idx, len(self._endpoints)):
             current_url = self._endpoints[ep_idx]
 
             for attempt in range(self.max_retries):
                 try:
                     logging.debug(
-                        f"LLM request attempt {attempt + 1}/{self.max_retries} "
-                        f"-> {current_url}"
-                    )
-
-                    response = requests.post(
+                        "LLM request attempt %s/%s -> %s",
+                        attempt + 1,
+                        self.max_retries,
                         current_url,
-                        json=payload,
-                        headers=headers,
-                        timeout=self.timeout
+                    )
+                    logging.info(
+                        "LLM request started (wall_clock=%ds, stream_stuck=%ds). Using streaming to detect stuck.",
+                        wall_clock_limit,
+                        stream_stuck_seconds,
                     )
 
-                    if response.status_code == 200:
-                        result = response.json()
+                    result = self._make_request_streaming(
+                        current_url,
+                        payload,
+                        headers,
+                        stream_stuck_seconds=stream_stuck_seconds,
+                        wall_clock_limit=wall_clock_limit,
+                    )
 
-                        # Extract content from Ollama response
-                        content = result.get('message', {}).get('content', '')
-                        if not content:
-                            content = result.get('response', '')
-
-                        # Promote this endpoint as active for future calls
+                    if result is not None:
                         if ep_idx != self._active_endpoint_idx:
                             logging.info(
-                                f"Switched active LLM endpoint to: {current_url}"
+                                "Switched active LLM endpoint to: %s",
+                                current_url,
                             )
                             self._active_endpoint_idx = ep_idx
                             self.api_url = current_url
+                        return result
 
-                        return {
-                            'content': content,
-                            'model': result.get('model', self.model),
-                            'done': result.get('done', True)
-                        }
-                    else:
-                        error_msg = f"HTTP {response.status_code}: {response.text}"
-                        logging.error(f"LLM API error: {error_msg}")
-                        if attempt < self.max_retries - 1:
-                            wait_time = self.retry_delay * (2 ** attempt)
-                            logging.info(f"Retrying in {wait_time:.1f}s...")
-                            time.sleep(wait_time)
-
-                except requests.exceptions.Timeout:
-                    logging.error(f"Request timeout after {self.timeout}s ({current_url})")
+                    logging.warning(
+                        "Stream returned no result (stuck or error). Retry %s/%s.",
+                        attempt + 1,
+                        self.max_retries,
+                    )
                     if attempt < self.max_retries - 1:
                         wait_time = self.retry_delay * (2 ** attempt)
+                        logging.info("Retrying in %.1fs...", wait_time)
                         time.sleep(wait_time)
 
                 except requests.exceptions.ConnectionError as e:
@@ -179,23 +281,21 @@ class LLMClient:
                         current_url,
                         cause_str,
                     )
-                    # Connection error: no point retrying same endpoint
                     break
 
                 except Exception as e:
-                    logging.error(f"Unexpected error: {e}")
+                    logging.error("Unexpected error: %s", e)
                     if attempt < self.max_retries - 1:
                         wait_time = self.retry_delay * (2 ** attempt)
                         time.sleep(wait_time)
 
-            # Current endpoint exhausted; try next
             if ep_idx + 1 < len(self._endpoints):
                 logging.warning(
-                    f"Falling back to next LLM endpoint: "
-                    f"{self._endpoints[ep_idx + 1]}"
+                    "Falling back to next LLM endpoint: %s",
+                    self._endpoints[ep_idx + 1],
                 )
 
-        logging.error("All LLM endpoints failed")
+        logging.error("All LLM endpoints failed after retries. Stopping.")
         return None
     
     def _create_structured_prompt(self, factor_data: Dict) -> str:
@@ -351,7 +451,7 @@ Answer only in JSON, no other text."""
         ]
         
         # Make request
-        response = self._make_request(messages, temperature=0.3, max_tokens=2000)
+        response = self._make_request(messages, temperature=0.3, max_tokens=1000)
         
         if response and response.get('content'):
             # Parse response
@@ -407,8 +507,7 @@ Answer only in JSON, no other text."""
             }
         ]
         
-        # Make request with higher temperature for more creative suggestions
-        response = self._make_request(messages, temperature=0.4, max_tokens=2500)
+        response = self._make_request(messages, temperature=0.4, max_tokens=1500)
         
         if response and response.get('content'):
             # Parse response

@@ -294,33 +294,8 @@ class PerformanceMonitor:
         
         print("=" * 80)
     
-    def save_report(self, file_path: str):
-        """
-        Save performance report to JSON file.
-        
-        :param file_path: Output file path
-        """
-        report = self.generate_performance_report()
-        
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, default=str)
-        
-        logging.info(f"Performance report saved to {file_path}")
-    
-    def reset(self):
-        """
-        Reset all metrics (start new session).
-        """
-        self.metrics.clear()
-        self.operation_counts.clear()
-        self.error_counts.clear()
-        self.start_times.clear()
-        self.session_start = datetime.now()
-        
-        logging.info("Performance monitor reset")
 
 
-# Global instance for easy access
 _global_monitor = None
 
 def get_monitor() -> PerformanceMonitor:
@@ -333,36 +308,3 @@ def get_monitor() -> PerformanceMonitor:
     if _global_monitor is None:
         _global_monitor = PerformanceMonitor()
     return _global_monitor
-
-
-if __name__ == "__main__":
-    # Test the performance monitor
-    monitor = PerformanceMonitor()
-    
-    # Test decorator
-    @monitor.track_time("test_operation")
-    def test_function():
-        time.sleep(0.1)
-        return "done"
-    
-    # Test manual tracking
-    for i in range(5):
-        monitor.start_operation(f"manual_op_{i}")
-        time.sleep(0.05)
-        monitor.end_operation(f"manual_op_{i}")
-    
-    # Test function calls
-    for i in range(3):
-        test_function()
-    
-    # Test error tracking
-    monitor.record_error("test_operation")
-    
-    # Generate and print report
-    monitor.print_report()
-    
-    # Save report
-    import tempfile
-    report_path = tempfile.mktemp(suffix='.json')
-    monitor.save_report(report_path)
-    print(f"\nReport saved to: {report_path}")

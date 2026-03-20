@@ -205,7 +205,7 @@ class LLMOrchestrator:
                 use_ai_generation = False  # Can be made configurable
                 
                 logging.info(f"Generating parameter space using {'AI' if use_ai_generation else 'min/max'} method...")
-                param_grid = self.param_generator.analyze_and_generate_params(
+                param_grid, _ = self.param_generator.analyze_and_generate_params(
                     asset=asset,
                     factor_name=factor_name,
                     factor_data=factor_data,
@@ -515,7 +515,7 @@ class LLMOrchestrator:
             factor_data = check_result.get('factor_data')
             if param_grid is None and self.param_generator and factor_data is not None:
                 logging.info("Generating intelligent parameter space using AI...")
-                param_grid = self.param_generator.analyze_and_generate_params(
+                param_grid, method_reason = self.param_generator.analyze_and_generate_params(
                     asset=asset,
                     factor_name=factor_name,
                     factor_data=factor_data
@@ -523,7 +523,8 @@ class LLMOrchestrator:
                 result['steps']['param_generation'] = {
                     'status': 'completed',
                     'param_grid': param_grid,
-                    'combinations': self._count_param_combinations(param_grid)
+                    'combinations': self._count_param_combinations(param_grid),
+                    'method_reason': method_reason
                 }
             
             # Step 2: Explore factor

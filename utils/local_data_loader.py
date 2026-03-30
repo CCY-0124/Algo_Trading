@@ -216,11 +216,6 @@ class ColumnDetector:
         logging.info(f"Available columns in {file_path}: {list(df.columns)}")
         logging.info(f"Data shape: {df.shape}")
         
-        # Show last 10 rows for user reference
-        print(f"\n=== Data Preview (Last 10 rows) from {file_path} ===")
-        print(df.tail(10).to_string())
-        print("=" * 80)
-        
         # Auto-detect timestamp column
         timestamp_col = None
         timestamp_candidates = ['t', 'timestamp', 'time', 'date', 'datetime']
@@ -742,6 +737,12 @@ class LocalDataLoader:
             logging.error(f"Failed to load factor data for {asset}/{factor_name}")
 
         return df
+
+    def clear_factor_cache(self):
+        """Clear factor cache to free memory. Call after each factor is done."""
+        count = len(self._factor_cache)
+        self._factor_cache.clear()
+        logging.debug(f"Factor cache cleared: {count} entries freed")
     
     def load_factor_data_by_param(self, asset: str, param_name: str, factor_name: str = None, 
                                  clean_method: str = 'drop', interactive: bool = False, 

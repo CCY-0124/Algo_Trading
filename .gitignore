@@ -78,4 +78,5 @@ scripts_purpose_documentation.md
 tools/
 config/llm_agent_config.json
 docs/
-
+.claude/
+CLAUDE.md

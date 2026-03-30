@@ -1,21 +1,23 @@
 """
 report_generator.py
 
-Report generator for daily backtest results.
-
-Features:
-- Generate multiple report formats (JSON, text, LLM analysis)
-- Include LLM analysis summaries
-- Provide recommendations and warnings
-- Visualize data
+Report generator for daily backtest results (compact JSON).
 """
 
 import json
 import logging
-import os
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
+
+PROMISING_SHARPE_THRESHOLD = 1.0
+
+_TIME_STAT_KEYS = frozenset({
+    'total_time', 'avg_time', 'min_time', 'max_time', 'median_time', 'stdev_time',
+})
+_SECONDS_SUFFIX_KEYS = frozenset({
+    'session_duration_seconds', 'total_time_seconds', 'average_operation_time',
+})
 
 # Configure logging
 logging.basicConfig(
@@ -42,37 +44,121 @@ class ReportGenerator:
         
         logging.info(f"Report Generator initialized")
         logging.info(f"  Output directory: {self.output_dir}")
-    
+
+    @staticmethod
+    def _secs_str(value: Union[int, float]) -> str:
+        return f"{round(float(value), 2)} secs"
+
+    @staticmethod
+    def _round2(value: Any) -> Any:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return round(float(value), 2)
+        return value
+
+    def _final_performance_row(self, result: Dict) -> Optional[Dict]:
+        best = result.get('best_result') or {}
+        if not best:
+            return None
+        sharpe = best.get('sharpe_ratio', 0) or 0
+        if sharpe < PROMISING_SHARPE_THRESHOLD:
+            return None
+        return {
+            'factor_id': result.get('factor_id'),
+            'asset': result.get('asset'),
+            'factor_name': result.get('factor_name'),
+            'sharpe_ratio': self._round2(sharpe),
+            'calmar_ratio': self._round2(best.get('calmar_ratio', 0)),
+            'total_return': self._round2(best.get('total_return', 0)),
+            'annual_return': self._round2(best.get('annual_return', 0)),
+            'max_drawdown': self._round2(best.get('max_drawdown', 0)),
+            'num_trades': int(best.get('num_trades', 0) or 0),
+            'parameters': best.get('params', {}),
+        }
+
+    def _build_promising_factors_ranked(self, successful_results: List[Dict]) -> List[Dict]:
+        rows: List[Dict] = []
+        for result in successful_results:
+            row = self._final_performance_row(result)
+            if row:
+                rows.append(row)
+        rows.sort(key=lambda x: x.get('sharpe_ratio', 0), reverse=True)
+        return rows
+
+    def _format_operation_stats_block(self, op_stats: Dict) -> Dict:
+        out: Dict[str, Any] = {}
+        for key, val in op_stats.items():
+            if key in ('count', 'errors', 'operation'):
+                out[key] = val
+            elif key in _TIME_STAT_KEYS and isinstance(val, (int, float)):
+                out[key] = self._secs_str(val)
+            elif key == 'error_rate' and isinstance(val, (int, float)):
+                out[key] = self._round2(val)
+            elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                out[key] = self._round2(val)
+            else:
+                out[key] = val
+        return out
+
+    def _format_full_performance_report(self, raw: Dict) -> Dict:
+        formatted: Dict[str, Any] = {}
+        for key, val in raw.items():
+            if key == 'operation_stats' and isinstance(val, dict):
+                formatted[key] = {
+                    name: self._format_operation_stats_block(stats)
+                    for name, stats in val.items()
+                    if isinstance(stats, dict)
+                }
+            elif key == 'bottleneck' and isinstance(val, dict):
+                bn = dict(val)
+                if isinstance(bn.get('stats'), dict):
+                    bn['stats'] = self._format_operation_stats_block(bn['stats'])
+                formatted[key] = bn
+            elif key in _SECONDS_SUFFIX_KEYS and isinstance(val, (int, float)):
+                formatted[key] = self._secs_str(val)
+            elif key in ('total_operations', 'total_errors') and isinstance(val, int):
+                formatted[key] = val
+            elif key == 'summary' and isinstance(val, str):
+                # JSON escapes newlines as \n in a single string; use lines array for readable reports.
+                formatted['summary_lines'] = val.splitlines()
+            elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                formatted[key] = self._round2(val)
+            else:
+                formatted[key] = val
+        return formatted
+
+    def _format_legacy_operation_only(self, raw: Dict) -> Dict:
+        return {
+            name: self._format_operation_stats_block(stats)
+            for name, stats in raw.items()
+            if isinstance(stats, dict)
+        }
+
+    def _format_performance_section(self, performance_stats: Optional[Dict]) -> Dict:
+        if not performance_stats:
+            return {}
+        if 'session_duration_seconds' in performance_stats or 'operation_stats' in performance_stats:
+            return self._format_full_performance_report(performance_stats)
+        return self._format_legacy_operation_only(performance_stats)
+
     def generate_daily_report(self,
                              date_str: str,
                              all_results: List[Dict],
                              daily_summary: Dict,
                              performance_stats: Dict = None) -> Dict:
         """
-        Generate comprehensive daily report.
-        
-        :param date_str: Date string (YYYY-MM-DD)
-        :param all_results: All processing results
-        :param daily_summary: Daily summary from context manager
-        :param performance_stats: Performance statistics (optional)
-        :return: Complete report dictionary
+        Generate compact daily report: summary, ranked promising factors (best combo only), performance.
         """
         logging.info(f"Generating daily report for {date_str}")
-        
-        # Filter successful results
+
         successful_results = [r for r in all_results if r.get('status') == 'completed']
         failed_results = [r for r in all_results if r.get('status') in ['failed', 'error']]
-        
-        # Extract best factors
-        top_factors = self._extract_top_factors(successful_results, limit=20)
-        
-        # Extract LLM insights
-        llm_insights = self._extract_llm_insights(successful_results)
-        
-        # Generate recommendations
-        recommendations = self._generate_recommendations(successful_results, top_factors)
-        
-        # Build report (statistics excluded per user preference)
+
+        promising_ranked = self._build_promising_factors_ranked(successful_results)
+
+        session_secs = 0.0
+        if performance_stats:
+            session_secs = float(performance_stats.get('session_duration_seconds', 0) or 0)
+
         report = {
             'date': date_str,
             'timestamp': datetime.now().isoformat(),
@@ -81,185 +167,15 @@ class ReportGenerator:
                 'successful': len(successful_results),
                 'failed': len(failed_results),
                 'promising_factors': daily_summary.get('promising_factors', 0),
-                'best_sharpe': daily_summary.get('best_sharpe', 0),
+                'best_sharpe': self._round2(daily_summary.get('best_sharpe', 0)),
                 'best_factor_id': daily_summary.get('best_factor_id'),
-                'total_time_seconds': performance_stats.get('session_duration_seconds', 0) if performance_stats else 0
+                'total_time': self._secs_str(session_secs),
             },
-            'top_factors': top_factors,
-            'llm_insights': llm_insights,
-            'recommendations': recommendations,
-            'performance': performance_stats,
-            'all_results_count': len(all_results)
+            'promising_factors_ranked': promising_ranked,
+            'performance': self._format_performance_section(performance_stats),
         }
-        
+
         return report
-    
-    def _extract_top_factors(self, results: List[Dict], limit: int = 20) -> List[Dict]:
-        """
-        Extract top performing factors.
-
-        In addition to the single best result per factor, also include all
-        parameter combinations whose Sharpe ratio is greater than 1.0.
-        
-        :param results: Successful results (each produced by LLMOrchestrator.process_factor)
-        :param limit: Maximum number of factors to return
-        :return: List of top factors with per-parameter results
-        """
-        # Sort by Sharpe ratio of final best_result
-        sorted_results = sorted(
-            results,
-            key=lambda x: x.get('best_result', {}).get('sharpe_ratio', 0),
-            reverse=True
-        )
-
-        top_factors: List[Dict] = []
-
-        for result in sorted_results[:limit]:
-            best_result = result.get('best_result', {})
-            if not best_result:
-                continue
-
-            # Collect per-parameter results from Stage 1, Stage 2, and optional optimization
-            steps = result.get('steps', {})
-            exploration = steps.get('exploration', {})
-
-            param_results: List[Dict] = []
-
-            # Stage 1 grid search results
-            stage1 = exploration.get('stage1', {}) if isinstance(exploration, dict) else {}
-            stage1_results = stage1.get('results', []) or []
-            for r in stage1_results:
-                sharpe = r.get('sharpe_ratio', 0)
-                if sharpe <= 1.0:
-                    continue
-                param_results.append({
-                    'source': 'stage1_grid_search',
-                    'sharpe_ratio': sharpe,
-                    'calmar_ratio': r.get('calmar_ratio', 0),
-                    'total_return': r.get('total_return', 0),
-                    'annual_return': r.get('annual_return', 0),
-                    'max_drawdown': r.get('max_drawdown', 0),
-                    'num_trades': r.get('num_trades', 0),
-                    'parameters': r.get('params', {}),
-                })
-
-            # Stage 2 LLM iterative optimization results (if present)
-            stage2 = exploration.get('stage2') or {}
-            if isinstance(stage2, dict):
-                iteration_results = stage2.get('iteration_results', []) or []
-                for r in iteration_results:
-                    sharpe = r.get('sharpe_ratio', 0)
-                    if sharpe <= 1.0:
-                        continue
-                    param_results.append({
-                        'source': 'stage2_iterative',
-                        'sharpe_ratio': sharpe,
-                        'calmar_ratio': r.get('calmar_ratio', 0),
-                        'total_return': r.get('total_return', 0),
-                        'annual_return': r.get('annual_return', 0),
-                        'max_drawdown': r.get('max_drawdown', 0),
-                        'num_trades': r.get('num_trades', 0),
-                        'parameters': r.get('params', {}),
-                    })
-
-            # Optional optimization step driven by LLM suggestions
-            optimization = steps.get('optimization') or {}
-            if isinstance(optimization, dict):
-                optimized_results = optimization.get('optimized_results', []) or []
-                for r in optimized_results:
-                    sharpe = r.get('sharpe_ratio', 0)
-                    if sharpe <= 1.0:
-                        continue
-                    param_results.append({
-                        'source': 'llm_guided_optimization',
-                        'sharpe_ratio': sharpe,
-                        'calmar_ratio': r.get('calmar_ratio', 0),
-                        'total_return': r.get('total_return', 0),
-                        'annual_return': r.get('annual_return', 0),
-                        'max_drawdown': r.get('max_drawdown', 0),
-                        'num_trades': r.get('num_trades', 0),
-                        'parameters': r.get('params', {}),
-                    })
-
-            # Build factor-level summary
-            factor_info = {
-                'factor_id': result.get('factor_id'),
-                'asset': result.get('asset'),
-                'factor_name': result.get('factor_name'),
-                # Final best result (for quick reference)
-                'sharpe_ratio': best_result.get('sharpe_ratio', 0),
-                'calmar_ratio': best_result.get('calmar_ratio', 0),
-                'total_return': best_result.get('total_return', 0),
-                'annual_return': best_result.get('annual_return', 0),
-                'max_drawdown': best_result.get('max_drawdown', 0),
-                'num_trades': best_result.get('num_trades', 0),
-                'parameters': best_result.get('params', {}),
-                # All parameter combinations with Sharpe > 1.0
-                'param_results': param_results,
-            }
-            top_factors.append(factor_info)
-
-        return top_factors
-    
-    def _extract_llm_insights(self, results: List[Dict]) -> Dict:
-        """
-        Extract LLM insights from results (counts only; no common_insights, risk_warnings, sample_analyses).
-        
-        :param results: Successful results
-        :return: LLM insights dictionary
-        """
-        llm_analyses = []
-        factors_with_potential = 0
-        
-        for result in results:
-            llm_analysis = result.get('steps', {}).get('llm_analysis')
-            if llm_analysis:
-                llm_analyses.append(llm_analysis)
-                if llm_analysis.get('has_potential', False):
-                    factors_with_potential += 1
-        
-        return {
-            'total_llm_analyses': len(llm_analyses),
-            'factors_with_potential': factors_with_potential,
-        }
-    
-    def _generate_recommendations(self, results: List[Dict], top_factors: List[Dict]) -> Dict:
-        """
-        Generate recommendations based on results.
-        
-        :param results: Successful results
-        :param top_factors: Top performing factors
-        :return: Recommendations dictionary
-        """
-        deployment_candidates = []
-        needs_review = []
-        
-        # Deployment candidates (high Sharpe and Calmar)
-        for factor in top_factors[:10]:
-            sharpe = factor.get('sharpe_ratio', 0)
-            calmar = factor.get('calmar_ratio', 0)
-            if sharpe >= 2.0 and calmar >= 2.0:
-                deployment_candidates.append({
-                    'factor_id': factor.get('factor_id'),
-                    'sharpe_ratio': sharpe,
-                    'calmar_ratio': calmar,
-                    'reason': 'High Sharpe and Calmar ratios'
-                })
-        
-        # Needs review (moderate performance)
-        for factor in top_factors[10:30]:
-            sharpe = factor.get('sharpe_ratio', 0)
-            if 1.0 <= sharpe < 2.0:
-                needs_review.append({
-                    'factor_id': factor.get('factor_id'),
-                    'sharpe_ratio': sharpe,
-                    'reason': 'Moderate performance, may benefit from further optimization'
-                })
-        
-        return {
-            'deployment_candidates': deployment_candidates,
-            'needs_review': needs_review,
-        }
     
     def save_json_report(self, report: Dict, date_str: str):
         """
@@ -288,35 +204,41 @@ class ReportGenerator:
 
 
 if __name__ == "__main__":
-    # Test the report generator
     print("Testing Report Generator...")
-    
-    # Create sample report
-    sample_report = {
-        'date': '2025-01-15',
-        'summary': {
-            'total_factors_analyzed': 100,
-            'successful': 80,
-            'failed': 20,
-            'promising_factors': 25,
-            'best_sharpe': 2.5,
-            'best_factor_id': 'BTC_sopr'
-        },
-        'top_factors': [
-            {
-                'factor_id': 'BTC_sopr',
-                'sharpe_ratio': 2.5,
+    gen = ReportGenerator()
+    sample_results = [
+        {
+            'status': 'completed',
+            'factor_id': 'BTC_sopr',
+            'asset': 'BTC',
+            'factor_name': 'sopr',
+            'best_result': {
+                'sharpe_ratio': 2.512345,
                 'calmar_ratio': 3.2,
-                'total_return': 0.35
-            }
-        ],
-        'llm_insights': {
-            'total_llm_analyses': 25,
-            'factors_with_potential': 15
+                'total_return': 0.35,
+                'annual_return': 0.12,
+                'max_drawdown': 0.08,
+                'num_trades': 40,
+                'params': {'rolling': 14, 'param_method': 'zscore'},
+            },
         }
+    ]
+    summary = {
+        'promising_factors': 1,
+        'best_sharpe': 2.512345,
+        'best_factor_id': 'BTC_sopr',
     }
-    
-    generator = ReportGenerator()
-    generator.save_all_reports(sample_report, '2025-01-15')
-    
-    print("✅ Report generator test completed!")
+    perf = {
+        'session_duration_seconds': 1.234,
+        'total_operations': 5,
+        'total_time_seconds': 0.5,
+        'total_errors': 0,
+        'average_operation_time': 0.1,
+        'error_rate': 0.0,
+        'bottleneck': None,
+        'operation_stats': {},
+        'summary': 'test',
+    }
+    rep = gen.generate_daily_report('2025-01-15', sample_results, summary, perf)
+    gen.save_all_reports(rep, '2025-01-15')
+    print("Report generator test completed.")

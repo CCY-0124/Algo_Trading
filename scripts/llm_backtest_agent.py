@@ -16,6 +16,7 @@ import os
 import json
 import logging
 import argparse
+import math
 from datetime import datetime
 from typing import Dict, List, Optional
 from pathlib import Path
@@ -24,6 +25,7 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategies.enhanced_non_price_strategy import EnhancedNonPriceStrategy
+from config.trading_config import DEFAULT_INITIAL_CAPITAL, get_lot_size
 from core.llm_client import LLMClient
 from core.context_manager import ContextManager
 from core.factor_screening import TwoStageFactorScreening
@@ -35,7 +37,8 @@ from utils.local_data_loader import LocalDataLoader
 from utils.report_generator import ReportGenerator
 
 # Configure logging with verbosity control
-from utils.log_config import configure_logging, set_verbosity
+from utils.log_config import configure_logging, set_verbosity, QuietLogger
+import signal
 
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _logs_dir = os.path.join(_project_root, 'logs')
@@ -76,10 +79,12 @@ class LLMBacktestAgent:
         """Initialize all system components."""
         logging.info("Initializing components...")
         
-        # Strategy
+        # Strategy (defaults align with config.trading_config when keys omitted)
+        _assets = self.config.get('assets') or ['BTC']
+        _primary_asset = _assets[0] if _assets else 'BTC'
         self.strategy = EnhancedNonPriceStrategy(
-            initial_capital=self.config.get('initial_capital', 10000),
-            min_lot_size=self.config.get('min_lot_size', 0.001),
+            initial_capital=self.config.get('initial_capital', DEFAULT_INITIAL_CAPITAL),
+            min_lot_size=self.config.get('min_lot_size', get_lot_size(_primary_asset)),
             use_api=self.config.get('use_api', True),
             param_method=self.config.get('param_method', 'pct_change')
         )
@@ -88,8 +93,11 @@ class LLMBacktestAgent:
         llm_config = self.config.get('llm', {})
         self.llm_client = LLMClient(
             api_url=llm_config.get('api_url', 'http://192.168.1.212:11434/api/chat'),
-            model=llm_config.get('model', 'qwen3.5:4b'),
+            model=llm_config.get('model', 'qwen3.5:2b'),
+            timeout=int(llm_config.get('timeout', 120)),
             fallback_urls=llm_config.get('fallback_urls', []),
+            wall_clock_limit=int(llm_config.get('wall_clock_limit', 300)),
+            stream_stuck_seconds=int(llm_config.get('stream_stuck_seconds', 60)),
         )
         
         # Context Manager
@@ -488,12 +496,19 @@ class LLMBacktestAgent:
         progress_file = self._get_progress_path()
         os.makedirs(os.path.dirname(progress_file), exist_ok=True)
 
+        def _strip_equity_curves(obj):
+            if isinstance(obj, dict):
+                return {k: (_strip_equity_curves(v) if k != 'equity_curve' else []) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_strip_equity_curves(i) for i in obj]
+            return obj
+
         progress_data = {
             'timestamp': datetime.now().isoformat(),
             'current': current,
             'total': total,
             'progress_pct': (current / total) * 100 if total else 0,
-            'results': results,
+            'results': _strip_equity_curves(results),
             'factor_list': factor_list
         }
 
@@ -624,12 +639,12 @@ class LLMBacktestAgent:
             summary_data=summary.get('summary_data', {})
         )
         self.performance_monitor.print_report()
-        perf_stats = self.performance_monitor.get_all_stats()
+        perf_report = self.performance_monitor.generate_performance_report()
         daily_report = self.report_generator.generate_daily_report(
             date_str=self.date_str,
             all_results=all_results,
             daily_summary=summary,
-            performance_stats=perf_stats
+            performance_stats=perf_report
         )
         self.report_generator.save_all_reports(daily_report, self.date_str)
         if self.data_cache:
@@ -673,7 +688,67 @@ class LLMBacktestAgent:
             'error': str(error)
         }
 
-    def run_daily_workflow(self, resume: bool = False):
+    def _run_validation(self, report_path: str = None):
+        """
+        Call FactorValidationAgent silently; print a one-line summary when done.
+        Returns the report dict (or None on error).
+        """
+        import importlib
+        fva_mod = importlib.import_module("scripts.factor_validation_agent")
+        FactorValidationAgent = fva_mod.FactorValidationAgent
+
+        val_config = {
+            "train_pct": self.config.get("validation", {}).get("train_pct", 0.65),
+            "oos_sharpe_threshold": self.config.get("validation", {}).get("oos_sharpe_threshold", 0.8),
+            "sharpe_decay_threshold": self.config.get("validation", {}).get("sharpe_decay_threshold", 0.4),
+            "correlation_threshold": self.config.get("validation", {}).get("correlation_threshold", 0.7),
+            "min_oos_trades": self.config.get("validation", {}).get("min_oos_trades", 5),
+            "min_oos_days": self.config.get("validation", {}).get("min_oos_days", 90),
+            "report_path": report_path,
+        }
+        val_agent = FactorValidationAgent(val_config)
+
+        # Suppress all output during validation; print summary after
+        logging.disable(logging.CRITICAL)
+        _fd1 = os.dup(1)
+        _fd2 = os.dup(2)
+        _dn = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_dn, 1)
+        os.dup2(_dn, 2)
+        os.close(_dn)
+        _orig_out = sys.stdout
+        _orig_err = sys.stderr
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
+        report = None
+        try:
+            report = val_agent.run()
+        finally:
+            logging.disable(logging.NOTSET)
+            sys.stdout.close()
+            sys.stderr.close()
+            sys.stdout = _orig_out
+            sys.stderr = _orig_err
+            os.dup2(_fd1, 1)
+            os.dup2(_fd2, 2)
+            os.close(_fd1)
+            os.close(_fd2)
+
+        if report:
+            s = report.get("summary", {})
+            pa = s.get("pool_actions", {})
+            ps = s.get("pool_state", {})
+            passed = s.get("stage1_passed", 0)
+            total = s.get("total_input_factors", 0)
+            print(
+                f"  Validation: {passed}/{total} passed | "
+                f"added={pa.get('added',0)} replaced={pa.get('replaced',0)} "
+                f"rejected={pa.get('rejected_corr',0)+pa.get('rejected_weaker',0)} | "
+                f"pool={ps.get('total',0)}"
+            )
+        return report
+
+    def run_daily_workflow(self, resume: bool = False, validate: bool = False):
         """
         Run complete daily workflow.
 
@@ -722,13 +797,153 @@ class LLMBacktestAgent:
             else:
                 all_results = self.process_all_factors(factor_list)
 
-            return self._finish_workflow(all_results, partial=getattr(self, '_stopped_early', False))
+            result = self._finish_workflow(all_results, partial=getattr(self, '_stopped_early', False))
+
+            if validate and result.get("status") in ("success", "partial"):
+                self._run_validation()
+
+            return result
 
         except Exception as e:
             logging.error(f"Error in daily workflow: {e}")
             import traceback
             traceback.print_exc()
             return self._finish_workflow_on_error(e)
+
+    def run_batch_validate_loop(self, batch_size: int, validate: bool = True):
+        """
+        Process all factors in batches until all are done.
+        - Shows per-factor progress on console; suppresses backtest noise.
+        - Saves a batch snapshot report after each batch.
+        - Runs validation on each batch's results and updates the pool.
+        - Press Ctrl+C to stop gracefully after the current factor and write daily report.
+        - Resumes from progress_latest.json if a previous run was interrupted.
+        """
+        self._stop_requested = False
+
+        def _handle_stop(signum, frame):
+            # Write directly to stderr so it shows even when stdout is suppressed
+            import sys as _sys
+            _sys.stderr.write("\n[Stopping after current factor... daily report will be written]\n")
+            _sys.stderr.flush()
+            self._stop_requested = True
+
+        original_handler = signal.signal(signal.SIGINT, _handle_stop)
+
+        batch_reports_dir = Path(_project_root) / "reports" / "batch_reports"
+        batch_reports_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            factor_list = self.get_factor_list()
+            if not factor_list:
+                print("No factors to process!")
+                return
+
+            checkpoint = self._load_progress()
+            completed_set = set()
+            accumulated_results = []
+            if checkpoint:
+                accumulated_results, completed_set, _ = checkpoint
+                print(f"Resuming: {len(completed_set)}/{len(factor_list)} factors already done")
+
+            remaining = [
+                f for f in factor_list
+                if (f.get("asset"), f.get("factor_name")) not in completed_set
+            ]
+            total_batches = math.ceil(len(remaining) / batch_size) if remaining else 0
+            print(f"Starting: {len(remaining)} factors | {total_batches} batches of {batch_size}")
+
+            batch_num = 0
+            while remaining and not self._stop_requested:
+                batch_num += 1
+                batch = remaining[:batch_size]
+                remaining = remaining[batch_size:]
+
+                print(f"\n=== Batch {batch_num}/{total_batches} ({len(batch)} factors) ===")
+
+                # Process one factor at a time: show progress, check stop flag
+                for i, factor_info in enumerate(batch):
+                    if self._stop_requested:
+                        break
+                    left = len(batch) - i - 1
+                    print(
+                        f"  [{i+1}/{len(batch)}] {factor_info['asset']}/{factor_info['factor_name']}"
+                        f"  |  {left} left in batch",
+                        flush=True,
+                    )
+                    # Suppress all output: redirect OS-level fds so even cached
+                    # StreamHandler references (which ignore sys.stdout reassignment)
+                    # get silenced. Also disable logging globally as extra measure.
+                    import sys as _sys
+                    logging.disable(logging.CRITICAL)
+                    _orig_stdout_obj = _sys.stdout
+                    _orig_stderr_obj = _sys.stderr
+                    _fd1 = os.dup(1)   # save original stdout fd
+                    _fd2 = os.dup(2)   # save original stderr fd
+                    _dn = os.open(os.devnull, os.O_WRONLY)
+                    os.dup2(_dn, 1)
+                    os.dup2(_dn, 2)
+                    os.close(_dn)
+                    _sys.stdout = open(os.devnull, 'w')
+                    _sys.stderr = open(os.devnull, 'w')
+                    try:
+                        result = self.process_all_factors(
+                            [factor_info],
+                            initial_results=accumulated_results,
+                            factor_list_full=factor_list,
+                        )
+                    finally:
+                        logging.disable(logging.NOTSET)
+                        _sys.stdout.close()
+                        _sys.stderr.close()
+                        _sys.stdout = _orig_stdout_obj
+                        _sys.stderr = _orig_stderr_obj
+                        os.dup2(_fd1, 1)
+                        os.dup2(_fd2, 2)
+                        os.close(_fd1)
+                        os.close(_fd2)
+                    accumulated_results = [r for r in result if r is not None]
+                    self.strategy.data_loader.clear_factor_cache()
+
+                # Save batch snapshot (only this batch's factors)
+                batch_keys = {(f["asset"], f["factor_name"]) for f in batch}
+                batch_only = [
+                    r for r in accumulated_results
+                    if r and (r.get("asset"), r.get("factor_name")) in batch_keys
+                ]
+                batch_summary = self.generate_daily_summary(batch_only)
+                batch_report = self.report_generator.generate_daily_report(
+                    date_str=self.date_str,
+                    all_results=batch_only,
+                    daily_summary=batch_summary,
+                    performance_stats={},
+                )
+                batch_file = batch_reports_dir / f"report_{self.date_str}_batch{batch_num:03d}.json"
+                with open(batch_file, "w", encoding="utf-8") as f:
+                    json.dump(batch_report, f, indent=2, ensure_ascii=False, default=str)
+                print(f"  Batch report saved -> {batch_file.name}")
+
+                if validate:
+                    try:
+                        self._run_validation(report_path=str(batch_file))
+                    except Exception as e:
+                        print(f"  Validation failed: {e}")
+
+            # Write final daily report
+            valid = [r for r in accumulated_results if r is not None]
+            if valid:
+                stopped_early = self._stop_requested or bool(remaining)
+                print(f"\nWriting daily report ({len(valid)} factors processed)...")
+                self._finish_workflow(valid, partial=stopped_early)
+                print(f"Daily report saved -> reports/daily_reports/report_{self.date_str}.json")
+
+            if self._stop_requested:
+                print("Stopped by user.")
+            elif not remaining:
+                print("All batches complete!")
+
+        finally:
+            signal.signal(signal.SIGINT, original_handler)
 
 
 def load_config(config_path: str = None) -> Dict:
@@ -746,8 +961,8 @@ def load_config(config_path: str = None) -> Dict:
     return {
         'assets': ['BTC'],
         'factors': [],  # Empty = all available factors
-        'initial_capital': 10000,
-        'min_lot_size': 0.001,
+        'initial_capital': DEFAULT_INITIAL_CAPITAL,
+        'min_lot_size': get_lot_size('BTC'),
         'use_api': True,
         'param_method': 'pct_change',
         'date_range': ['2023-01-01', '2025-08-10'],
@@ -809,6 +1024,26 @@ def main():
         metavar='N',
         help='Limit run to first N factors (overrides config max_factors)'
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Run FactorValidationAgent after daily workflow completes",
+    )
+    parser.add_argument(
+        "--batch-validate",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Process factors in batches of N, validating after each batch",
+    )
+    parser.add_argument(
+        "--assets",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="ASSET",
+        help="Assets to backtest, e.g. --assets BTC ETH (overrides config)",
+    )
 
     args = parser.parse_args()
     
@@ -831,6 +1066,9 @@ def main():
     if args.max_factors is not None:
         config['max_factors'] = args.max_factors
         logging.info(f"Limiting to {args.max_factors} factors (from --max-factors)")
+    if args.assets is not None:
+        config['assets'] = args.assets
+        logging.info(f"Assets overridden to: {args.assets}")
 
     # Create agent
     agent = LLMBacktestAgent(config)
@@ -840,7 +1078,11 @@ def main():
         success = agent.test_llm_connection()
         sys.exit(0 if success else 1)
     
-    result = agent.run_daily_workflow(resume=args.resume)
+    if args.batch_validate:
+        agent.run_batch_validate_loop(batch_size=args.batch_validate, validate=True)
+        sys.exit(0)
+
+    result = agent.run_daily_workflow(resume=args.resume, validate=args.validate)
 
     status = result.get('status', 'error')
     if status == 'success':

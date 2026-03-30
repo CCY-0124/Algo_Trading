@@ -67,7 +67,9 @@ class LLMClient:
                  timeout: int = 120,
                  max_retries: int = 3,
                  retry_delay: float = 2.0,
-                 fallback_urls: List[str] = None):
+                 fallback_urls: List[str] = None,
+                 stream_stuck_seconds: int = 60,
+                 wall_clock_limit: int = 300):
         """
         Initialize LLM client.
 
@@ -79,11 +81,15 @@ class LLMClient:
         :param fallback_urls: Ordered list of fallback Ollama endpoints tried
                               when the primary endpoint is unreachable
                               (e.g. ["http://<jetson>:11434/api/chat"])
+        :param stream_stuck_seconds: Abort if no chunk received for this long
+        :param wall_clock_limit: Hard cap on total wait per attempt (monotonic clock)
         """
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.stream_stuck_seconds = int(stream_stuck_seconds)
+        self.wall_clock_limit = int(wall_clock_limit)
 
         # Build ordered endpoint list: primary first, then fallbacks
         self._endpoints: List[str] = [api_url] + (fallback_urls or [])
@@ -96,6 +102,11 @@ class LLMClient:
             logging.info(f"  Fallback URLs: {fallback_urls}")
         logging.info(f"  Model: {model}")
         logging.info(f"  Timeout: {timeout}s")
+        logging.info(
+            "  Streaming limits: wall_clock=%ds, stream_stuck=%ds",
+            self.wall_clock_limit,
+            self.stream_stuck_seconds,
+        )
     
     def _make_request_streaming(
         self,
@@ -119,13 +130,15 @@ class LLMClient:
         line_queue = queue.Queue()
         stream_error = []
 
+        read_timeout = max(30, min(120, stream_stuck_seconds + 15))
+
         def read_stream():
             try:
                 with requests.post(
                     current_url,
                     json=payload,
                     headers=headers,
-                    timeout=(10, 90),
+                    timeout=(10, read_timeout),
                     stream=True,
                 ) as response:
                     if response.status_code != 200:
@@ -143,9 +156,13 @@ class LLMClient:
         reader = threading.Thread(target=read_stream, daemon=True)
         reader.start()
 
+        poll_interval = min(5.0, float(stream_stuck_seconds))
+        last_chunk_mono = request_start
+
         try:
             while True:
-                elapsed = time.monotonic() - request_start
+                now = time.monotonic()
+                elapsed = now - request_start
                 if elapsed >= wall_clock_limit:
                     logging.error(
                         "Wall-clock limit reached: %.0fs >= %ds. Force-aborting LLM request.",
@@ -153,21 +170,31 @@ class LLMClient:
                     )
                     return None
 
-                remaining = min(stream_stuck_seconds, wall_clock_limit - elapsed)
+                time_budget = wall_clock_limit - elapsed
+                idle = now - last_chunk_mono
+                idle_budget = max(0.0, float(stream_stuck_seconds) - idle)
+                wait_sec = min(poll_interval, time_budget, idle_budget)
+                wait_sec = max(wait_sec, 0.05)
+
                 try:
-                    line = line_queue.get(timeout=max(remaining, 1))
+                    line = line_queue.get(timeout=wait_sec)
                 except queue.Empty:
-                    if time.monotonic() - request_start >= wall_clock_limit:
+                    now = time.monotonic()
+                    if now - request_start >= wall_clock_limit:
                         logging.error(
-                            "Wall-clock limit reached: %ds. Force-aborting LLM request.",
+                            "Wall-clock limit reached: %.0fs >= %ds. Force-aborting LLM request.",
+                            now - request_start,
                             wall_clock_limit,
                         )
-                    else:
+                        return None
+                    if now - last_chunk_mono >= float(stream_stuck_seconds):
                         logging.warning(
-                            "LLM stream stuck: no chunk for %ds. Aborting request.",
-                            stream_stuck_seconds,
+                            "LLM stream stuck: no chunk for %.0fs. Aborting request.",
+                            now - last_chunk_mono,
                         )
-                    return None
+                        return None
+                    continue
+                last_chunk_mono = time.monotonic()
                 if line is None:
                     if stream_error:
                         e = stream_error[0]
@@ -210,13 +237,16 @@ class LLMClient:
 
     def _make_request(self, messages: List[Dict], temperature: float = 0.3,
                       max_tokens: int = 2000,
-                      stream_stuck_seconds: int = 60,
-                      wall_clock_limit: int = 300) -> Optional[Dict]:
+                      stream_stuck_seconds: Optional[int] = None,
+                      wall_clock_limit: Optional[int] = None) -> Optional[Dict]:
         """
         Make HTTP request to Ollama API with streaming and retry.
         Uses streaming to detect no response; retries up to max_retries then stops.
         wall_clock_limit is an absolute hard cutoff per attempt (default 5 min).
         """
+        ss = self.stream_stuck_seconds if stream_stuck_seconds is None else int(stream_stuck_seconds)
+        wc = self.wall_clock_limit if wall_clock_limit is None else int(wall_clock_limit)
+
         payload = {
             "model": self.model,
             "messages": messages,
@@ -241,16 +271,16 @@ class LLMClient:
                     )
                     logging.info(
                         "LLM request started (wall_clock=%ds, stream_stuck=%ds). Using streaming to detect stuck.",
-                        wall_clock_limit,
-                        stream_stuck_seconds,
+                        wc,
+                        ss,
                     )
 
                     result = self._make_request_streaming(
                         current_url,
                         payload,
                         headers,
-                        stream_stuck_seconds=stream_stuck_seconds,
-                        wall_clock_limit=wall_clock_limit,
+                        stream_stuck_seconds=ss,
+                        wall_clock_limit=wc,
                     )
 
                     if result is not None:
